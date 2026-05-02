@@ -54,6 +54,44 @@ The easiest way to train and test the models is to use the provided `docker/dock
 The docker file is based on the one provided by pogema-benchmark. We also provide
 `docker/dockerfile_ssil` to run the SSIL evaluation.
 
+### Local Docker workflow
+For local experimentation, this repository also includes:
+
+- `docker/docker-compose.yml` for running the project in a mounted container
+- `Makefile` with helper targets for build, testing, and animation export
+
+Typical workflow:
+
+```sh
+make build
+make gpu-check
+make demo-small
+make demo-svg
+```
+
+This produces an animated SVG at:
+
+```text
+outputs/svg/anim_0.svg
+```
+
+### Converting SVG animation to GIF
+`pogema` saves animations as animated SVG files. To convert them to GIF inside the
+container, first start a persistent container, then install the GIF tools once, and
+finally run the conversion:
+
+```sh
+docker compose -f docker/docker-compose.yml run -d --name hmagat-work hmagat sleep infinity
+make gif-tools
+make gif
+```
+
+This creates:
+
+```text
+outputs/anim_0.gif
+```
+
 ## HMAGAT
 HMAGAT is a hypergraph attention network for MAPF. We base it on MAGAT
 by [Li et. al.](https://arxiv.org/abs/2011.13219). We include the dataset generation
