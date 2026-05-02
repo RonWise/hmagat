@@ -3,6 +3,7 @@ import unittest
 import torch
 from torch_geometric.data import Data
 
+from hmagat.imitation_dataset_pyg import MAPFHypergraphDataset
 from hmagat.modules.agents import DecentralPlannerGATNet, load_partial_state_dict
 
 
@@ -144,6 +145,40 @@ class HMAGATCSTest(unittest.TestCase):
             new_model.state_dict()["cnn.convs.0.weight"],
             torch.full_like(new_model.state_dict()["cnn.convs.0.weight"], 0.25),
         )
+
+    def test_hypergraph_dataset_exposes_first_step_for_training_loop(self):
+        dense_dataset = (
+            [
+                torch.randn(4, 3, 13, 13),
+                torch.randn(4, 3, 13, 13),
+                torch.randn(4, 3, 13, 13),
+            ],
+            [torch.ones(4, 4), torch.ones(4, 4), torch.ones(4, 4)],
+            [torch.zeros(4, dtype=torch.long)] * 3,
+            [torch.zeros(4, dtype=torch.bool)] * 3,
+            torch.tensor([0, 0, 1]),
+        )
+        hyperedge_indices = (
+            [
+                torch.tensor([[0, 1, 2, 3], [0, 0, 1, 1]], dtype=torch.long),
+                torch.tensor([[0, 1, 2, 3], [0, 0, 1, 1]], dtype=torch.long),
+                torch.tensor([[0, 1, 2, 3], [0, 0, 1, 1]], dtype=torch.long),
+            ],
+            [
+                torch.tensor([[0, 0, 1, 1], [0, 1, 2, 3]], dtype=torch.long),
+                torch.tensor([[0, 0, 1, 1], [0, 1, 2, 3]], dtype=torch.long),
+                torch.tensor([[0, 0, 1, 1], [0, 1, 2, 3]], dtype=torch.long),
+            ],
+        )
+        dataset = MAPFHypergraphDataset(
+            dense_dataset,
+            hyperedge_indices,
+            use_edge_attr=False,
+        )
+
+        self.assertTrue(dataset[0].first_step.item())
+        self.assertFalse(dataset[1].first_step.item())
+        self.assertTrue(dataset[2].first_step.item())
 
 
 if __name__ == "__main__":

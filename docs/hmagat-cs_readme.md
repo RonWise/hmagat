@@ -179,6 +179,24 @@ out = model(data.x, data)
 snapshot. Это проверяет совместимость forward/backward, но еще не обучает CS как
 настоящую память последовательности.
 
+Проверенный engineering smoke:
+
+- tiny dataset был сгенерирован во временной директории `/tmp` внутри
+  `hmagat-work`;
+- `DirectionalHMAGAT + coordination_state_size=32` стартовал из старого
+  `checkpoints/hmagat/best.pt` через `--load_partial_parameters_path`;
+- `train_imitation_learning_pyg.py` прошел 1 epoch;
+- результат smoke:
+
+```text
+Epoch 0, Mean Loss: 1.6612034440040588, Mean Accuracy: 0.1666666716337204
+```
+
+Во время smoke был найден и исправлен pipeline contract bug:
+`MAPFHypergraphDataset` теперь, как и `MAPFGraphDataset`, возвращает
+`first_step`, потому что train loop использует `data.first_step` для
+map-level counters.
+
 Для полноценного sequence-aware training нужен следующий этап:
 
 - хранить episode boundaries и timestep order;

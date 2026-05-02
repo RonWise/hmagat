@@ -716,11 +716,13 @@ docker exec hmagat-work bash -lc 'cd /workspace && python -m unittest tests.test
 - forward для `DirectionalHMAGAT + coordination_state`;
 - partial checkpoint loading из старой архитектуры в новую с пропуском
   `GRUCell` и всего расширенного первого decoder layer.
+- `first_step` contract для `MAPFHypergraphDataset`, который нужен train loop
+  для подсчета map-level counters.
 
 Результат:
 
 ```text
-Ran 5 tests
+Ran 6 tests
 OK
 ```
 
@@ -804,6 +806,30 @@ Average Sum of Costs: 1040.0
 Цель проверки была инженерной -- подтвердить, что `HMAGAT-CS` inference path
 работает с partial-loaded старым checkpoint.
 
+Также выполнен маленький training smoke на временном dataset в `/tmp` внутри
+контейнера:
+
+1. `hmagat.run_expert` сгенерировал 4/4 успешных expert trajectories.
+2. `hmagat.convert_to_imitation_dataset` построил processed graph snapshots.
+3. `hmagat.generate_hypergraphs` построил hypergraph indices.
+4. `hmagat.generate_additional_data` построил normalized cost-to-go features.
+5. `hmagat.generate_pos` построил positions для edge attributes.
+6. `hmagat.train_imitation_learning_pyg` был запущен на 1 epoch с
+   `coordination_state_size=32` и
+   `--load_partial_parameters_path checkpoints/hmagat/best.pt`.
+
+Первый запуск smoke выявил реальный pipeline bug: `MAPFHypergraphDataset` не
+передавал `first_step`, хотя train loop использует `data.first_step` и для
+graph, и для hypergraph batches. Исправление добавило тот же `first_step`
+contract в hypergraph dataset.
+
+После исправления training smoke прошел:
+
+```text
+Starting Training....
+Epoch 0, Mean Loss: 1.6612034440040588, Mean Accuracy: 0.1666666716337204
+```
+
 Во всех случаях shape выхода был ожидаемый:
 
 ```text
@@ -827,6 +853,7 @@ state_reset True
 - [docker/dockerfile_ssil](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docker/dockerfile_ssil)
 - [docs/hmagat_baseline.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat_baseline.md)
 - [hmagat/modules/agents.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/agents.py)
+- [hmagat/imitation_dataset_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/imitation_dataset_pyg.py)
 - [hmagat/modules/temperature_sampling/actor_critic.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/temperature_sampling/actor_critic.py)
 - [hmagat/post_train_quality_imp.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/post_train_quality_imp.py)
 - [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
@@ -834,6 +861,7 @@ state_reset True
 - [test_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/test_imitation_learning_pyg.py)
 - [tests/test_hmagat_cs.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/tests/test_hmagat_cs.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
+- [.gitignore](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/.gitignore)
 
 Untracked директории с generated/demo artifacts:
 
@@ -843,6 +871,7 @@ Untracked директории с generated/demo artifacts:
 Файлы, измененные именно в рамках текущего MVP `HMAGAT-CS`:
 
 - [hmagat/modules/agents.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/agents.py)
+- [hmagat/imitation_dataset_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/imitation_dataset_pyg.py)
 - [hmagat/modules/temperature_sampling/actor_critic.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/temperature_sampling/actor_critic.py)
 - [hmagat/post_train_quality_imp.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/post_train_quality_imp.py)
 - [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
@@ -881,21 +910,19 @@ Untracked директории с generated/demo artifacts:
 
 ## Ближайшие следующие шаги
 
-1. Сделать маленький training smoke на небольшом dataset, чтобы проверить, что
-   новый режим не ломает backward pass.
-2. Добавить sequence-aware training path:
+1. Добавить sequence-aware training path:
 
    - группировать данные по episode;
    - сохранять порядок timesteps;
    - сбрасывать hidden state на границах episode;
    - считать loss по всем шагам последовательности.
-3. Добавить experiment configs:
+2. Добавить experiment configs:
 
    - baseline `HMAGAT`;
    - `HMAGAT-CS` с `coordination_state_size=32`;
    - `HMAGAT-CS` с `coordination_state_size=64`;
    - dense / bottleneck / narrow corridor evaluation.
-4. После этого переходить к ablation и анализу токена:
+3. После этого переходить к ablation и анализу токена:
 
    - livelock rate;
    - oscillation frequency;

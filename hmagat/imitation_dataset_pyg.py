@@ -305,6 +305,13 @@ class MAPFHypergraphDataset(Dataset):
                 target_vec = torch.concatenate([target_vec, dist], dim=-1)
             extra_kwargs["target_vec"] = target_vec
 
+        if index == 0:
+            first_step = True
+        else:
+            first_step = self.graph_map_id[index] != self.graph_map_id[index - 1]
+        first_step = torch.BoolTensor([first_step])
+        extra_kwargs = extra_kwargs | {"first_step": first_step}
+
         extra_kwargs = extra_kwargs | add_additional_data(
             additional_data=self.additional_data,
             additional_data_idx=self.additional_data_idx,
