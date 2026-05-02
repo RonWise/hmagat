@@ -19,7 +19,7 @@ class CombinedModel(torch.nn.Module):
         self.device = model.device
 
     def in_simulation(self, in_simulation):
-        pass
+        self.model.in_simulation(in_simulation)
 
     def forward(self, x, gdata):
         out, pre_gnn_input = self.model(x, gdata, return_pre_gnn_input=True)

@@ -665,6 +665,8 @@ class DecentralPlannerGATNet(torch.nn.Module):
         lin_x_before_additional_data=False,
         use_edge_attr_for_messages=None,
         edge_attr_cnn_mode=None,
+        coordination_state_size=0,
+        coordination_state_update="gru",
     ):
         super().__init__()
 
@@ -753,14 +755,33 @@ class DecentralPlannerGATNet(torch.nn.Module):
             **gnn_kwargs,
         )
 
+        gnn_output_size = num_attention_heads * embedding_sizes_gnn[-1]
+        self.coordination_state_size = coordination_state_size
+        self.coordination_state_update = coordination_state_update
+        self.coordination_state_cell = None
+        self._coordination_state = None
+        if self.coordination_state_size > 0:
+            if self.coordination_state_update != "gru":
+                raise ValueError(
+                    "Only GRU coordination-state updates are currently supported."
+                )
+            self.coordination_state_cell = torch.nn.GRUCell(
+                input_size=gnn_output_size,
+                hidden_size=self.coordination_state_size,
+            )
+
         #####################################################################
         #                                                                   #
         #                    MLP --- map to actions                         #
         #                                                                   #
         #####################################################################
 
+        actions_input_size = gnn_output_size
+        if self.coordination_state_size > 0:
+            actions_input_size += self.coordination_state_size
+
         actions_mlp_sizes = [
-            num_attention_heads * embedding_sizes_gnn[-1],
+            actions_input_size,
             embedding_sizes_gnn[-1],
             num_classes,
         ]
@@ -780,7 +801,7 @@ class DecentralPlannerGATNet(torch.nn.Module):
         for res in module_residual:
             if res == "cnn-to-out":
                 self.cnn_to_out_lin = torch.nn.Linear(
-                    cnn_output_size, actions_mlp_sizes[0]
+                    cnn_output_size, gnn_output_size
                 )
             else:
                 raise ValueError(f"Unsupported module_residual: {res}.")
@@ -795,6 +816,8 @@ class DecentralPlannerGATNet(torch.nn.Module):
         if self.hypergraph_generator is not None:
             self.hypergraph_generator.reset_parameters()
         self.gnn.reset_parameters()
+        if self.coordination_state_cell is not None:
+            self.coordination_state_cell.reset_parameters()
         for lin in self.actionsMLP:
             lin.reset_parameters()
         if self.cnn_to_out_lin is not None:
@@ -802,6 +825,10 @@ class DecentralPlannerGATNet(torch.nn.Module):
 
     def in_simulation(self, value):
         self.simulation = value
+        self.reset_coordination_state()
+
+    def reset_coordination_state(self):
+        self._coordination_state = None
 
     @property
     def device(self):
@@ -835,6 +862,8 @@ class DecentralPlannerGATNet(torch.nn.Module):
             res_out = self.cnn_to_out_lin(cnn_out)
             res_out = F.relu(res_out)
             x = res_out + x
+        if self.coordination_state_cell is not None:
+            x = self._apply_coordination_state(x)
         for lin in self.actionsMLP[:-1]:
             x = lin(x)
             x = F.relu(x)
@@ -846,6 +875,23 @@ class DecentralPlannerGATNet(torch.nn.Module):
             return x, pre_gnn_input
 
         return x
+
+    def _apply_coordination_state(self, x):
+        if self.simulation:
+            prev_state = self._coordination_state
+            if (
+                prev_state is None
+                or prev_state.shape[0] != x.shape[0]
+                or prev_state.device != x.device
+                or prev_state.dtype != x.dtype
+            ):
+                prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
+            state = self.coordination_state_cell(x, prev_state)
+            self._coordination_state = state.detach()
+        else:
+            prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
+            state = self.coordination_state_cell(x, prev_state)
+        return torch.cat([x, state], dim=-1)
 
 
 def _decode_residual_args(args):
@@ -868,6 +914,8 @@ _GNN_DEF_KEYS = [
     "use_edge_attr_for_messages",
     "edge_attr_cnn_mode",
     "final_feature_generator",
+    "coordination_state_size",
+    "coordination_state_update",
 ]
 
 
@@ -884,6 +932,8 @@ def _decode_args(args: dict, prefix: str = "") -> dict:
             "model_residuals",
             "use_edge_attr_for_messages",
             "edge_attr_cnn_mode",
+            "coordination_state_size",
+            "coordination_state_update",
         ]
     }
     gnn_kwargs = dict()

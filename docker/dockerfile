@@ -1,6 +1,10 @@
 FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-devel
 
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
 ADD docker/requirements.txt /tmp/
+ADD docker/wheels /tmp/wheels
 
 RUN apt update && apt install -y \
     build-essential \
@@ -14,8 +18,8 @@ RUN apt update && apt install -y \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
-    && conda install -c conda-forge pybind11 \
+    && rm -rf /var/lib/apt/lists/* /var/tmp/* \
+    && conda install -y -c conda-forge pybind11 \
     && apt update && apt-get install -y \
     cmake \
     g++ \
@@ -25,35 +29,43 @@ RUN apt update && apt install -y \
     libyaml-cpp-dev \
     unzip
 
-RUN pip install torch_geometric \
-    && pip install pyg_lib==0.3.1 torch-scatter==2.1.1 torch_sparse==0.6.17 torch_spline_conv==1.2.2 torch_cluster==1.6.1 -f https://pytorch-geometric.com/whl/torch-1.13.1+cu116.html
+RUN pip install --no-cache-dir torch_geometric \
+    && pip install --no-cache-dir /tmp/wheels/*.whl
 
 RUN pip install markupsafe==2.0.1
 
 RUN wget https://github.com/microsoft/onnxruntime/releases/download/v1.14.1/onnxruntime-linux-x64-1.14.1.tgz \
     && tar -xf onnxruntime-linux-x64-1.14.1.tgz \
-    && cp onnxruntime-linux-x64-1.14.1/lib/* /usr/lib/ && cp onnxruntime-linux-x64-1.14.1/include/* /usr/include/
+    && cp onnxruntime-linux-x64-1.14.1/lib/* /usr/lib/ \
+    && cp onnxruntime-linux-x64-1.14.1/include/* /usr/include/
 
 RUN wget https://download.pytorch.org/libtorch/cu116/libtorch-cxx11-abi-shared-with-deps-1.13.1%2Bcu116.zip \
     && unzip libtorch-cxx11-abi-shared-with-deps-1.13.1+cu116.zip
 
 RUN rm -rf libtorch-cxx11-abi-shared-with-deps-1.13.1+cu116.zip
 
-RUN pip install cmake \
-    && apt install -y software-properties-common \
-    && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
-    && apt update \
-    && apt-get -y install gcc-11 g++-11
+RUN pip install cmake
 
 RUN apt-get install -y libeigen3-dev
 
 ADD ./pyamg ./pyamg
- RUN cd pyamg && SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install .
+RUN python - <<'PY'
+from pathlib import Path
+path = Path('pyamg/pyproject.toml')
+text = path.read_text()
+needle = "[tool.versioningit.next-version]"
+insert = '[tool.versioningit]\ndefault-version = "5.3.0"\n\n'
+if '[tool.versioningit]\n' not in text:
+    text = text.replace(needle, insert + needle, 1)
+    path.write_text(text)
+PY
+RUN cd pyamg && pip install .
 
 RUN ln -s /usr/include/eigen3/Eigen /usr/local/include/Eigen
 RUN DEBIAN_FRONTEND="noninteractive" apt-get install -y libopencv-dev
 
 # Clean up APT when done.
-RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+RUN apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ADD . .

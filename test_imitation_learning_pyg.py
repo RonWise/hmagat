@@ -237,6 +237,32 @@ def main():
         file_path = pathlib.Path(args.svg_save_dir)
         file_path.mkdir(parents=True, exist_ok=True)
 
+        def _extract_edge_data(gdata):
+            if getattr(gdata, "edge_index", None) is not None:
+                return {
+                    "type": "graph",
+                    "edge_index": gdata.edge_index.detach().cpu().numpy(),
+                }
+            if (
+                getattr(gdata, "edge_index_src", None) is not None
+                and getattr(gdata, "edge_index_dst", None) is not None
+            ):
+                edge_data = {
+                    "type": "hypergraph",
+                    "edge_index_src": gdata.edge_index_src.detach().cpu().numpy(),
+                    "edge_index_dst": gdata.edge_index_dst.detach().cpu().numpy(),
+                }
+                if getattr(gdata, "hton_edge_index_src", None) is not None:
+                    edge_data["hton_edge_index_src"] = (
+                        gdata.hton_edge_index_src.detach().cpu().numpy()
+                    )
+                if getattr(gdata, "hton_edge_index_dst", None) is not None:
+                    edge_data["hton_edge_index_dst"] = (
+                        gdata.hton_edge_index_dst.detach().cpu().numpy()
+                    )
+                return edge_data
+            return {"type": "unknown"}
+
         def aux_func(env, observations, actions, rtdg, **kwargs):
             if actions is None:
                 aux_func.original_pos = np.array(
@@ -252,7 +278,7 @@ def main():
                 aux_func.original_pos = new_pos
                 aux_func.costs[~at_goals] = aux_func.makespan + 1
             gdata = rtdg(observations, env)
-            aux_func.edge_index.append(gdata.edge_index.detach().cpu().numpy())
+            aux_func.edge_index.append(_extract_edge_data(gdata))
 
     num_completed = 0
     num_tested = 0

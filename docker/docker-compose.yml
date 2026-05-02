@@ -1,0 +1,38 @@
+services:
+  hmagat:
+    image: hmagat:dev
+    build:
+      context: ..
+      dockerfile: docker/dockerfile
+      args:
+        HTTP_PROXY: ""
+        HTTPS_PROXY: ""
+        ALL_PROXY: ""
+        http_proxy: ""
+        https_proxy: ""
+        all_proxy: ""
+    container_name: hmagat-dev
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-0}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - PYTHONPATH=/workspace
+      - HOME=/root
+      - DISPLAY=
+      - PYOPENGL_PLATFORM=egl
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+    volumes:
+      - ..:/workspace
+      - ${HOME}/.cache/torch:/root/.cache/torch
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    shm_size: "16gb"
+    gpus: all
+    command: bash

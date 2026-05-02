@@ -126,6 +126,23 @@ def add_training_args(parser):
     parser.add_argument("--final_feature_generator", type=str, default="magat")
 
     parser.add_argument(
+        "--coordination_state_size",
+        type=int,
+        default=0,
+        help=(
+            "Hidden size for an optional recurrent coordination-state token. "
+            "Set to 0 to disable it."
+        ),
+    )
+    parser.add_argument(
+        "--coordination_state_update",
+        type=str,
+        default="gru",
+        choices=["gru"],
+        help="Update rule for the optional coordination-state token.",
+    )
+
+    parser.add_argument(
         "--oe_improve_quality", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--oe_improve_quality_threshold", type=float, default=0.8)

@@ -1,5 +1,8 @@
 FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-devel
 
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
 ADD docker/requirements.txt /tmp/
 ADD ssil/environment.yml /tmp/environment.yml
 
@@ -26,8 +29,8 @@ RUN apt update && apt install -y \
     libyaml-cpp-dev \
     unzip
 
-RUN pip install torch_geometric \
-    && pip install pyg_lib==0.3.1 torch-scatter==2.1.1 torch_sparse==0.6.17 torch_spline_conv==1.2.2 torch_cluster==1.6.1 -f https://pytorch-geometric.com/whl/torch-1.13.1+cu116.html
+RUN pip install --default-timeout=120 --retries=10 torch_geometric \
+    && pip install --default-timeout=120 --retries=10 pyg_lib==0.3.1 torch-scatter==2.1.1 torch_sparse==0.6.17 torch_spline_conv==1.2.2 torch_cluster==1.6.1 -f https://pytorch-geometric.com/whl/torch-1.13.1+cu116.html
 
 RUN pip install markupsafe==2.0.1
 
