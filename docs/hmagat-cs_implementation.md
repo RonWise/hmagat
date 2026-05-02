@@ -696,6 +696,34 @@ docker exec hmagat-work bash -lc \
 
 Результат: compile прошел.
 
+Добавлены unit-тесты для текущего `HMAGAT-CS` pipeline:
+
+- файл: `tests/test_hmagat_cs.py`;
+- запуск:
+
+```sh
+docker exec hmagat-work bash -lc 'cd /workspace && python -m unittest tests.test_hmagat_cs'
+```
+
+Тесты не мокают graph/model path, а создают маленькие реальные
+`DecentralPlannerGATNet` модели и реальные `torch_geometric.data.Data` объекты.
+Покрываются:
+
+- расширение decoder input при `coordination_state_size > 0`;
+- сохранение и reset per-agent recurrent state в `simulation=True`;
+- отсутствие сохранения hidden state в snapshot mode;
+- корректный `cnn-to-out` residual до добавления coordination state;
+- forward для `DirectionalHMAGAT + coordination_state`;
+- partial checkpoint loading из старой архитектуры в новую с пропуском
+  `GRUCell` и всего расширенного первого decoder layer.
+
+Результат:
+
+```text
+Ran 5 tests
+OK
+```
+
 Также внутри контейнера проверено наличие основных зависимостей:
 
 ```text
@@ -804,6 +832,7 @@ state_reset True
 - [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
 - [hmagat/training_args.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/training_args.py)
 - [test_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/test_imitation_learning_pyg.py)
+- [tests/test_hmagat_cs.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/tests/test_hmagat_cs.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
 
 Untracked директории с generated/demo artifacts:
@@ -819,6 +848,7 @@ Untracked директории с generated/demo artifacts:
 - [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
 - [hmagat/training_args.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/training_args.py)
 - [test_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/test_imitation_learning_pyg.py)
+- [tests/test_hmagat_cs.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/tests/test_hmagat_cs.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
 
 Остальные dirty-файлы уже были в рабочем дереве до текущего implementation-log
