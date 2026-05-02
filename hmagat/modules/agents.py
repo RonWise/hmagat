@@ -995,3 +995,75 @@ def get_model(args, device) -> tuple[torch.nn.Module, bool, dict]:
     model.reset_parameters()
 
     return model, hypergraph_model, dataset_kwargs | common_dataset_kwargs
+
+
+def load_partial_state_dict(model, state_dict, print_prefix=""):
+    model_state = model.state_dict()
+    loadable_state = OrderedDict()
+    skipped_missing = []
+    skipped_shape = []
+    skipped_related = []
+    shape_mismatch_modules = set()
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            skipped_missing.append(key)
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            shape_mismatch_modules.add(key.rsplit(".", 1)[0])
+            continue
+
+    for key, value in state_dict.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            continue
+        module_name = key.rsplit(".", 1)[0]
+        if module_name in shape_mismatch_modules:
+            skipped_related.append(key)
+            continue
+        loadable_state[key] = value
+
+    missing_after_load, unexpected_after_load = model.load_state_dict(
+        loadable_state, strict=False
+    )
+
+    print(f"{print_prefix}Partial checkpoint loading:")
+    print(f"{print_prefix}  loaded keys: {len(loadable_state)}")
+    print(f"{print_prefix}  skipped missing keys: {len(skipped_missing)}")
+    print(f"{print_prefix}  skipped shape-mismatch keys: {len(skipped_shape)}")
+    print(f"{print_prefix}  skipped related keys: {len(skipped_related)}")
+    print(f"{print_prefix}  model keys left missing: {len(missing_after_load)}")
+    print(f"{print_prefix}  unexpected keys after load: {len(unexpected_after_load)}")
+
+    if skipped_missing:
+        print(f"{print_prefix}  skipped missing key names:")
+        for key in skipped_missing:
+            print(f"{print_prefix}    {key}")
+
+    if skipped_shape:
+        print(f"{print_prefix}  skipped shape-mismatch key names:")
+        for key, checkpoint_shape, model_shape in skipped_shape:
+            print(
+                f"{print_prefix}    {key}: checkpoint {checkpoint_shape} -> model {model_shape}"
+            )
+
+    if skipped_related:
+        print(f"{print_prefix}  skipped keys from shape-mismatched modules:")
+        for key in skipped_related:
+            print(f"{print_prefix}    {key}")
+
+    if missing_after_load:
+        print(f"{print_prefix}  model keys initialized from current model:")
+        for key in missing_after_load:
+            print(f"{print_prefix}    {key}")
+
+    return {
+        "loaded": list(loadable_state.keys()),
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+        "skipped_related": skipped_related,
+        "missing_after_load": missing_after_load,
+        "unexpected_after_load": unexpected_after_load,
+    }

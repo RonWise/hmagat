@@ -67,6 +67,30 @@ $$
 агента $i$ выбирается из его текущего embedding $h_i^t$ и его собственного
 state $m_i^t$.
 
+Важно: это не привязывает архитектуру к фиксированному числу агентов. В модели
+создается одна общая `GRUCell`, и она применяется ко всем строкам batch с
+одними и теми же весами:
+
+$$
+m_i^t = \mathrm{GRUCell}_{\theta}(h_i^t, m_i^{t-1}), \qquad i = 1,\dots,N
+$$
+
+Параметры $\theta$ зависят от размерности $h_i^t$ и `coordination_state_size`,
+но не зависят от $N$. Число агентов влияет только на runtime shape:
+
+```text
+h:      [num_agents, h_dim]
+state:  [num_agents, coordination_state_size]
+logits: [num_agents, 5]
+```
+
+Поэтому одна и та же модель может работать с разным числом агентов. Главное
+условие корректности -- стабильное соответствие строки tensor-а конкретному
+агенту между timestep-ами. В rollout порядок агентов задается средой; для
+будущего sequence-aware training нужно явно сохранять соответствие
+`agent_id -> hidden state`, особенно если в batch попадут несколько episode или
+если порядок агентов может меняться.
+
 Новый минимальный вариант `HMAGAT-CS`:
 
 $$
@@ -99,6 +123,71 @@ $$
 
 На этом этапе мы реализуем только локальное рекуррентное состояние координации:
 новых каналов коммуникации между coordination-state tokens не добавляется.
+
+## Соответствие proposal
+
+Исходный proposal в
+`docs/HMAGAT_CS_proposal_ru.md` описывает более общий исследовательский замысел:
+добавить в HMAGAT latent temporal coordination state, который помогает модели
+отслеживать развитие локального конфликта во времени. Текущий код реализует
+первый минимальный слой этой идеи, но не всю предложенную архитектуру сразу.
+
+Что совпадает с proposal:
+
+- сохраняется основная мотивация: HMAGAT хорошо моделирует higher-order
+  interaction в текущем snapshot, но не имеет явного temporal state;
+- добавлен recurrent coordination-state token;
+- update rule реализован через `GRUCell`;
+- action decoder получает не только текущее представление после
+  `MAGAT/HMAGAT`, но и coordination state;
+- MVP не требует отдельной supervision для токена;
+- ожидаемые эффекты остаются теми же: меньше oscillation/livelock, лучшее
+  symmetry breaking и более устойчивое поведение в temporally ambiguous cases.
+
+Главное отличие от proposal: в proposal используется notation с единым
+`m_t` и pooled group summary `q_t`:
+
+```text
+group/hyperedge embeddings -> pooling -> q_t
+m_t = GRU(m_{t-1}, q_t)
+logits_t = MLP([h_t ; m_t])
+```
+
+В текущем MVP это сознательно сужено до per-agent recurrent state без
+отдельного pooling-слоя:
+
+```text
+h_i^t = MAGAT/HMAGAT(z_i^t, S_t)
+m_i^t = GRUCell(h_i^t, m_i^{t-1})
+logits_i^t = MLP([h_i^t ; m_i^t])
+```
+
+То есть текущая реализация не строит отдельный `q_t` из hyperedge/group
+embeddings. Group context попадает в coordination state косвенно: сначала
+`MAGAT/HMAGAT` смешивает информацию через graph/hypergraph interaction и
+формирует $h_i^t$, затем `GRUCell` обновляет состояние агента из этого
+group-conditioned embedding.
+
+Такое сужение выбрано как MVP по двум причинам:
+
+- оно минимально вмешивается в существующий code path `CNN -> MAGAT/HMAGAT -> MLP`;
+- оно сохраняет decentralized action decoding и не вводит спорный global token,
+  который мог бы привязать поведение всей команды к одному shared latent.
+
+Что пока не реализовано из proposal:
+
+- явный pooling `group/hyperedge embeddings -> q_t`;
+- non-recurrent coordination token ablation;
+- auxiliary heads для `oscillation/livelock risk`, `conflict phase prediction`,
+  `yield/pass prediction`;
+- полноценное sequence-aware обучение recurrent state;
+- отдельный interpretability analysis learned token dynamics.
+
+Tекущая реализация соответствует основной гипотезе proposal про
+latent temporal coordination state, но является более консервативным
+per-agent MVP. Она не реализует proposal буквально в части `q_t`/global token,
+и это важно учитывать при описании результатов: корректнее называть текущий
+вариант `HMAGAT-CS MVP`, а не полной версией proposal.
 
 ## Основная идея
 
@@ -197,40 +286,45 @@ coordination state так же, как во время inference.
 
 ## План реализации
 
-- [x] Добавить CLI-флаги для включения coordination state:
-   - `--coordination_state_size`;
-   - `--coordination_state_update`.
+- [X] Добавить CLI-флаги для включения coordination state:
 
-- [x] Расширить `DecentralPlannerGATNet`:
-   - принять новые параметры в `__init__`;
-   - создать `torch.nn.GRUCell`, если `coordination_state_size > 0`;
-   - увеличить вход action decoder с `h_dim` до `h_dim + coordination_state_size`;
-   - сохранить `cnn-to-out` residual в размерности `h_dim`, потому что residual
-     складывается с выходом GNN/HGNN до добавления coordination state;
-   - сбрасывать hidden state при входе/выходе из simulation.
+  - `--coordination_state_size`;
+  - `--coordination_state_update`.
+- [X] Расширить `DecentralPlannerGATNet`:
 
-- [x] Встроить update state в `forward` после `self.gnn(...)` и после optional
-   `cnn-to-out` residual, но до `actionsMLP`.
+  - принять новые параметры в `__init__`;
+  - создать `torch.nn.GRUCell`, если `coordination_state_size > 0`;
+  - увеличить вход action decoder с `h_dim` до `h_dim + coordination_state_size`;
+  - сохранить `cnn-to-out` residual в размерности `h_dim`, потому что residual
+    складывается с выходом GNN/HGNN до добавления coordination state;
+  - сбрасывать hidden state при входе/выходе из simulation.
+- [X] Встроить update state в `forward` после `self.gnn(...)` и после optional
+  `cnn-to-out` residual, но до `actionsMLP`.
+- [X] Сохранить backward compatibility:
 
-- [x] Сохранить backward compatibility:
-   - default `coordination_state_size=0`;
-   - при default-флагах старая архитектура не меняется;
-   - старые checkpoints должны продолжать грузиться в старую архитектуру без
-     новых флагов.
+  - default `coordination_state_size=0`;
+  - при default-флагах старая архитектура не меняется;
+  - старые checkpoints должны продолжать грузиться в старую архитектуру без
+    новых флагов.
+- [X] Добавить partial checkpoint loading для старого HMAGAT checkpoint:
 
-- [x] Проверить внутри Docker Compose контейнера проекта:
-   - compile;
-   - synthetic smoke для `MAGAT`;
-   - synthetic smoke для `MAGAT + coordination_state`;
-   - synthetic smoke для `DirectionalHMAGAT`;
-   - synthetic smoke для `DirectionalHMAGAT + coordination_state`;
-   - synthetic smoke для `CombinedModel` temperature wrapper.
+  - загрузить совместимые CNN/HGNN/decoder параметры;
+  - оставить `GRUCell` и расширенный decoder layer свежими;
+  - явно логировать loaded и skipped keys.
+- [X] Проверить внутри Docker Compose контейнера проекта:
 
+  - compile;
+  - synthetic smoke для `MAGAT`;
+  - synthetic smoke для `MAGAT + coordination_state`;
+  - synthetic smoke для `DirectionalHMAGAT`;
+  - synthetic smoke для `DirectionalHMAGAT + coordination_state`;
+  - synthetic smoke для `CombinedModel` temperature wrapper.
 - [ ] Следующий этап после MVP:
-   - добавить sequence-aware dataset / batching;
-   - обучать recurrent state на последовательностях expert trajectories;
-   - добавить ablation: `HMAGAT`, `HMAGAT + non-recurrent token`,
-     `HMAGAT-CS`.
+
+  - добавить sequence-aware dataset / batching;
+  - обучать recurrent state на последовательностях expert trajectories;
+  - добавить ablation: `HMAGAT`, `HMAGAT + non-recurrent token`,
+    `HMAGAT-CS`.
 
 ## Что уже сделано
 
@@ -269,7 +363,7 @@ coordination state так же, как во время inference.
 
 ### 2. Расширена сигнатура DecentralPlannerGATNet
 
-Файл: `hmagat/modules/agents.py`, строки 650-669.
+Файл: `hmagat/modules/agents.py`, строки 660-669.
 
 В `DecentralPlannerGATNet.__init__` добавлены параметры:
 
@@ -470,7 +564,7 @@ $$
 
 ### 10. Новые аргументы включены в model kwargs
 
-Файл: `hmagat/modules/agents.py`, строки 904-918.
+Файл: `hmagat/modules/agents.py`, строки 908-918.
 
 В список `_GNN_DEF_KEYS` добавлены:
 
@@ -479,7 +573,7 @@ $$
     "coordination_state_update",
 ```
 
-Файл: `hmagat/modules/agents.py`, строки 925-938.
+Файл: `hmagat/modules/agents.py`, строки 925-937.
 
 В `model_kwargs` добавлены те же параметры:
 
@@ -511,6 +605,71 @@ temperature sampling.
 Это сохраняет одинаковую семантику rollout для обычной модели и для модели,
 обернутой temperature sampler.
 
+### 12. Добавлен partial checkpoint loading
+
+Файл: `hmagat/modules/agents.py`, строки 1000-1069, функция
+`load_partial_state_dict`.
+
+Этот helper нужен, чтобы инициализировать `HMAGAT-CS` из старого pretrained
+`HMAGAT` checkpoint. Он загружает только те параметры, для которых совпадают имя
+и shape, а несовместимые параметры оставляет в текущей инициализации модели.
+
+Кодовая логика:
+
+```python
+def load_partial_state_dict(model, state_dict, print_prefix=""):
+    model_state = model.state_dict()
+    loadable_state = OrderedDict()
+    skipped_missing = []
+    skipped_shape = []
+    skipped_related = []
+    shape_mismatch_modules = set()
+    ...
+    missing_after_load, unexpected_after_load = model.load_state_dict(
+        loadable_state, strict=False
+    )
+```
+
+Если у параметра есть shape mismatch, например:
+
+```text
+actionsMLP.0.weight: checkpoint (128, 128) -> model (128, 160)
+```
+
+то helper пропускает и остальные параметры этого же модуля, например
+`actionsMLP.0.bias`. Это важно, чтобы расширенный decoder layer был
+инициализирован заново целиком, а не частично.
+
+Файлы training pipeline:
+
+- `hmagat/train_imitation_learning_pyg.py`, import на строке 177 и вызов на
+  строках 382-386;
+- `hmagat/post_train_quality_imp.py`, import на строке 302 и вызов на строках
+  439-443.
+
+В обоих файлах теперь используется существующий CLI-аргумент:
+
+```text
+--load_partial_parameters_path /path/to/old_hmagat_checkpoint.pt
+```
+
+Пример для старта `HMAGAT-CS` из старого HMAGAT checkpoint:
+
+```sh
+python -m hmagat.train_imitation_learning_pyg \
+  ... \
+  --imitation_learning_model DirectionalHMAGAT \
+  --coordination_state_size 32 \
+  --load_partial_parameters_path checkpoints/hmagat/best.pt
+```
+
+Ожидаемое поведение:
+
+- CNN/HGNN и совместимые слои загружаются из старого checkpoint;
+- `coordination_state_cell.*` остается свежим;
+- расширенный `actionsMLP.0.*` остается свежим;
+- все skipped keys печатаются явно.
+
 ## Проверки
 
 Проверки запускались внутри существующего Docker Compose контейнера проекта
@@ -526,7 +685,7 @@ docker start hmagat-work
 
 ```sh
 docker exec hmagat-work bash -lc \
-  'python -m py_compile hmagat/modules/agents.py hmagat/training_args.py'
+  'python -m py_compile hmagat/modules/agents.py hmagat/training_args.py hmagat/train_imitation_learning_pyg.py hmagat/post_train_quality_imp.py'
 ```
 
 Результат: compile прошел.
@@ -561,6 +720,27 @@ base coordination state (4, 8)
 state reset True
 ```
 
+Partial checkpoint loading проверен на старом `checkpoints/hmagat/best.pt` и
+новой модели с `coordination_state_size=32`.
+
+Ожидаемый smoke-output:
+
+```text
+loaded keys: 110
+skipped shape-mismatch keys: 1
+skipped related keys: 1
+model keys left missing: 6
+actionsMLP.0.weight: checkpoint (128, 128) -> model (128, 160)
+actionsMLP.0.bias
+coordination_state_cell.weight_ih
+coordination_state_cell.weight_hh
+coordination_state_cell.bias_ih
+coordination_state_cell.bias_hh
+```
+
+Это означает, что старая HMAGAT часть загружается, а новые recurrent параметры и
+расширенный decoder layer остаются инициализированными заново.
+
 Во всех случаях shape выхода был ожидаемый:
 
 ```text
@@ -577,12 +757,16 @@ state_reset True
 
 ## Список измененных файлов
 
-Текущий `git status --short` показывает следующие измененные файлы:
+Файлы, которые входят в рабочий набор изменений вокруг `HMAGAT-CS` и
+сопутствующего demo/runbook-контекста:
 
 - [docker/dockerfile](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docker/dockerfile)
 - [docker/dockerfile_ssil](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docker/dockerfile_ssil)
+- [docs/hmagat_baseline.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat_baseline.md)
 - [hmagat/modules/agents.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/agents.py)
 - [hmagat/modules/temperature_sampling/actor_critic.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/temperature_sampling/actor_critic.py)
+- [hmagat/post_train_quality_imp.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/post_train_quality_imp.py)
+- [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
 - [hmagat/training_args.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/training_args.py)
 - [test_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/test_imitation_learning_pyg.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
@@ -596,6 +780,8 @@ Untracked директории с generated/demo artifacts:
 
 - [hmagat/modules/agents.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/agents.py)
 - [hmagat/modules/temperature_sampling/actor_critic.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/modules/temperature_sampling/actor_critic.py)
+- [hmagat/post_train_quality_imp.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/post_train_quality_imp.py)
+- [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
 - [hmagat/training_args.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/training_args.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
 
@@ -614,43 +800,37 @@ Untracked директории с generated/demo artifacts:
 
    Поэтому при `simulation=False` hidden state каждый раз начинается с нулей.
    Чтобы обучать память как память, нужен dataset/batcher по последовательностям.
-
-2. Старые checkpoints совместимы только со старой архитектурой.
+2. Старые checkpoints не загружаются strict-режимом в новую архитектуру.
 
    Если `coordination_state_size=0`, архитектура старая. Если включить
    `coordination_state_size > 0`, появляются новые веса `GRUCell`, а вход
    decoder меняет размер. Поэтому старый checkpoint нельзя строго загрузить в
-   новую архитектуру без partial loading / transfer procedure.
-
+   новую архитектуру, но можно использовать `--load_partial_parameters_path`,
+   чтобы перенести совместимые CNN/HGNN/decoder параметры.
 3. Hidden state привязан к порядку агентов в batch.
 
    В rollout это соответствует текущему порядку агентов в среде. Если в будущем
    появится batching нескольких эпизодов или перестановка агентов между
-   timestep-ами, понадобится явно хранить соответствие `agent_id -> hidden
-   state`.
+   timestep-ами, понадобится явно хранить соответствие `agent_id -> hidden state`.
 
 ## Ближайшие следующие шаги
 
-1. Добавить явный режим partial load из старого HMAGAT checkpoint в HMAGAT-CS:
-   загрузить CNN/HGNN где shape совпадает, а `GRUCell` и расширенный decoder
-   инициализировать заново.
-
-2. Сделать маленький training smoke на небольшом dataset, чтобы проверить, что
+1. Сделать маленький training smoke на небольшом dataset, чтобы проверить, что
    новый режим не ломает backward pass.
+2. Добавить sequence-aware training path:
 
-3. Добавить sequence-aware training path:
    - группировать данные по episode;
    - сохранять порядок timesteps;
    - сбрасывать hidden state на границах episode;
    - считать loss по всем шагам последовательности.
+3. Добавить experiment configs:
 
-4. Добавить experiment configs:
    - baseline `HMAGAT`;
    - `HMAGAT-CS` с `coordination_state_size=32`;
    - `HMAGAT-CS` с `coordination_state_size=64`;
    - dense / bottleneck / narrow corridor evaluation.
+4. После этого переходить к ablation и анализу токена:
 
-5. После этого переходить к ablation и анализу токена:
    - livelock rate;
    - oscillation frequency;
    - success rate;

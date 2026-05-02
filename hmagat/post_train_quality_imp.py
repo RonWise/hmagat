@@ -299,7 +299,7 @@ def main():
     np.random.seed(args.model_seed)
     random.seed(args.model_seed)
 
-    from hmagat.modules.agents import get_model
+    from hmagat.modules.agents import get_model, load_partial_state_dict
 
     model, hypergraph_model, dataset_kwargs = get_model(args, device)
 
@@ -435,6 +435,12 @@ def main():
         pretrain_path = pathlib.Path(args.pretrain_weights_path)
         state_dict = torch.load(pretrain_path, map_location=device)
         model.load_state_dict(state_dict)
+
+    if args.load_partial_parameters_path is not None:
+        print("Partially Loading Weights.............")
+        partial_path = pathlib.Path(args.load_partial_parameters_path)
+        state_dict = torch.load(partial_path, map_location=device)
+        load_partial_state_dict(model, state_dict, print_prefix="[partial-load]")
 
     queue = mp.Queue()
     done_event = mp.Event()
