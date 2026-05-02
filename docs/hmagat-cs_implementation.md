@@ -647,7 +647,13 @@ actionsMLP.0.weight: checkpoint (128, 128) -> model (128, 160)
 - `hmagat/post_train_quality_imp.py`, import на строке 302 и вызов на строках
   439-443.
 
-В обоих файлах теперь используется существующий CLI-аргумент:
+Файл inference/demo pipeline:
+
+- `test_imitation_learning_pyg.py` использует тот же helper, чтобы можно было
+  запускать `HMAGAT-CS` rollout/demo из старого HMAGAT checkpoint без strict
+  shape mismatch.
+
+Во всех этих файлах теперь используется существующий CLI-аргумент:
 
 ```text
 --load_partial_parameters_path /path/to/old_hmagat_checkpoint.pt
@@ -741,6 +747,35 @@ coordination_state_cell.bias_hh
 Это означает, что старая HMAGAT часть загружается, а новые recurrent параметры и
 расширенный decoder layer остаются инициализированными заново.
 
+Также выполнен минимальный inference/demo smoke через `test_imitation_learning_pyg.py`
+без заранее подготовленного training dataset:
+
+```sh
+docker exec hmagat-work bash -lc 'cd /workspace && python test_imitation_learning_pyg.py ... \
+  --imitation_learning_model DirectionalHMAGAT \
+  --coordination_state_size 32 \
+  --load_partial_parameters_path checkpoints/hmagat/best.pt \
+  --test_num_samples 1 \
+  --test_num_agents 16+16 \
+  --test_max_episode_steps 64'
+```
+
+Smoke дошел до конца rollout без shape/load/runtime ошибок:
+
+```text
+Testing Graph 1/1, Current Success Rate: 0.0
+Final results:
+Success Rate: 0.0
+Average Makespan: 64.0
+Average Partial Success Rate: 0.0
+Average Sum of Costs: 1040.0
+```
+
+Нулевой success rate в этом smoke не является регрессией сам по себе: `GRUCell`
+и расширенный первый decoder layer инициализированы заново и еще не обучались.
+Цель проверки была инженерной -- подтвердить, что `HMAGAT-CS` inference path
+работает с partial-loaded старым checkpoint.
+
 Во всех случаях shape выхода был ожидаемый:
 
 ```text
@@ -783,6 +818,7 @@ Untracked директории с generated/demo artifacts:
 - [hmagat/post_train_quality_imp.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/post_train_quality_imp.py)
 - [hmagat/train_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/train_imitation_learning_pyg.py)
 - [hmagat/training_args.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/hmagat/training_args.py)
+- [test_imitation_learning_pyg.py](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/test_imitation_learning_pyg.py)
 - [docs/hmagat-cs_implementation.md](/home/work/WORK/MIPT/study/repos/heuristics/hmagat/docs/hmagat-cs_implementation.md)
 
 Остальные dirty-файлы уже были в рабочем дереве до текущего implementation-log

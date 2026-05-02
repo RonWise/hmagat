@@ -24,7 +24,7 @@ from hmagat.temperature_training import (
     add_temperature_sampling_args,
     get_temperature_sampling_model,
 )
-from hmagat.modules.agents import get_model
+from hmagat.modules.agents import get_model, load_partial_state_dict
 
 
 def count_parameters(model):
@@ -182,8 +182,14 @@ def main():
             args.checkpoints_dir, f"epoch_{args.model_epoch_num}.pt"
         )
 
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict)
+    if args.load_partial_parameters_path is not None:
+        print("Partially Loading Weights.............")
+        partial_path = pathlib.Path(args.load_partial_parameters_path)
+        state_dict = torch.load(partial_path, map_location=device)
+        load_partial_state_dict(model, state_dict, print_prefix="[partial-load]")
+    else:
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
     model = model.eval()
 
     if args.rl_based_temperature_sampling:
