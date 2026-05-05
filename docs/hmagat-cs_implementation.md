@@ -111,8 +111,8 @@ $$
 условие корректности -- стабильное соответствие строки tensor-а конкретному
 агенту между timestep-ами. В rollout порядок агентов задается средой; для
 sequence-aware training нужно явно сохранять соответствие
-$\texttt{agent\_id} \rightarrow \text{hidden state}$, особенно если в batch
-попадут несколько episode или если порядок агентов может меняться.
+`agent_id -> hidden state`, особенно если в batch попадут несколько episode или
+если порядок агентов может меняться.
 
 Новый минимальный вариант `HMAGAT-CS`:
 
@@ -207,8 +207,7 @@ sequence-aware path:
   сам переставит строки;
 - если внешний/custom dataset не содержит `agent_id`, helper логирует
   `loguru.warning` и явно продолжает через row-order assumption;
-- explicit $\texttt{agent\_id} \rightarrow \text{hidden state}$ reorder/reset
-  еще не реализован;
+- explicit `agent_id -> hidden state` reorder/reset еще не реализован;
 - masking завершившихся агентов остается в семантике существующего
   `loss_function` / `terminated`, отдельного sequence padding loss mask сейчас
   не требуется, потому что padding snapshots не добавляются в timestep batch.
@@ -1992,7 +1991,7 @@ Generated/demo artifacts, которые могут переноситься в 
    В rollout это соответствует текущему порядку агентов в среде. Если в будущем
    появится batching нескольких эпизодов или перестановка агентов между
    timestep-ами, понадобится явно хранить соответствие
-   $\texttt{agent\_id} \rightarrow \text{hidden state}$.
+   `agent_id -> hidden state`.
 
 ## Ближайшие следующие шаги
 
@@ -2011,7 +2010,7 @@ Generated/demo artifacts, которые могут переноситься в 
      row-position marker; если генератор dataset-а может менять порядок строк,
      нужен persistent environment-level `agent_id`;
    - если порядок может меняться, добавить явный
-     $\texttt{agent\_id} \rightarrow \text{hidden state}$ reorder;
+     `agent_id -> hidden state` reorder;
    - если появятся asynchronous episode resets внутри одного batch, добавить
      `reset_coordination_state(mask=...)` или эквивалентный partial reset.
 
