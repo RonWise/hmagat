@@ -31,7 +31,12 @@ class BaseLRScheduler:
 
 
 def get_estimated_total_number_of_steps(args, train_dataloader, fraction_of_oe=0.9):
-    number_of_steps = len(train_dataloader) * args.num_epochs
+    train_batches_per_epoch = len(train_dataloader)
+    max_train_batches = getattr(args, "max_train_batches", None)
+    if max_train_batches is not None:
+        train_batches_per_epoch = min(train_batches_per_epoch, max_train_batches)
+
+    number_of_steps = train_batches_per_epoch * args.num_epochs
     if args.skip_validation:
         return number_of_steps
 

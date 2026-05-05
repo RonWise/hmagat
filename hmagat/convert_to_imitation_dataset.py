@@ -1,14 +1,24 @@
 import argparse
+import gc
 import pickle
 import pathlib
 import numpy as np
 import torch
+from loguru import logger
 
 from scipy.spatial.distance import squareform, pdist
 
 from hmagat.run_expert import add_expert_dataset_args, get_expert_dataset_file_name
 
 from hmagat.dataset_loading import load_dataset
+from hmagat.downstream_shards import (
+    add_sharded_downstream_args,
+    graph_map_id_bounds,
+    iter_raw_expert_shards,
+    write_stage_manifest,
+    write_stage_shard,
+)
+from hmagat.progress_logging import ProgressLogger
 
 
 def add_imitation_dataset_args(parser):
@@ -46,6 +56,14 @@ def get_imitation_dataset_file_name(args):
     else:
         file_name = "default.pkl"
     return file_name
+
+
+def _as_torch_tensor(data):
+    if isinstance(data, torch.Tensor):
+        return data
+    if isinstance(data, np.ndarray):
+        return torch.from_numpy(data)
+    return torch.as_tensor(data)
 
 
 def generate_random_graph(
@@ -98,12 +116,18 @@ def generate_graph_dataset(
 
     assert save_termination_state, "Only support saving termination state for now"
 
+    actual_num_samples = len(dataset)
+    progress = None
+    if print_prefix is not None:
+        progress = ProgressLogger(
+            f"{print_prefix}Graph dataset generation".strip(),
+            actual_num_samples,
+            every_n=max(1, actual_num_samples // 100),
+            every_seconds=30.0,
+            requested_total=num_samples,
+        )
+
     for id, (sample_observations, actions, terminated) in enumerate(dataset):
-        if print_prefix is not None:
-            print(
-                f"{print_prefix}"
-                f"Generating Graph Dataset for map {id + 1}/{num_samples}"
-            )
         for observations in sample_observations:
             global_xys = np.array([obs["global_xy"] for obs in observations])
 
@@ -184,6 +208,11 @@ def generate_graph_dataset(
             graph_map_id.append(id + id_offset)
         dataset_target_actions.extend(actions)
         dataset_terminated.extend(terminated)
+        if progress is not None:
+            progress.update(
+                id + 1,
+                extra=f"snapshots={len(dataset_node_features)}",
+            )
 
     graph_map_id = np.array(graph_map_id)
 
@@ -199,7 +228,7 @@ def generate_graph_dataset(
             result = (*result, dataset_agent_pos)
         torch_results = []
         for res in result:
-            torch_res = [torch.from_numpy(np.array(data)) for data in res]
+            torch_res = [_as_torch_tensor(data) for data in res]
             torch_results.append(torch_res)
         return torch_results
 
@@ -222,16 +251,64 @@ def generate_graph_dataset(
     return tuple(torch.from_numpy(res) for res in result)
 
 
+def generate_processed_dataset_shards(args):
+    entries = []
+    graph_map_id_offset = 0
+
+    for shard_idx, record in enumerate(iter_raw_expert_shards(args)):
+        payload = record["payload"]
+        dense_dataset = generate_graph_dataset(
+            payload["dataset"],
+            args.comm_radius,
+            args.obs_radius,
+            args.num_samples,
+            args.save_termination_state,
+            args.use_edge_attr,
+            print_prefix=f"Processed shard {shard_idx}: ",
+            id_offset=graph_map_id_offset,
+            num_neighbour_cutoff=args.num_neighbour_cutoff,
+            neighbour_cutoff_method=args.neighbour_cutoff_method,
+            distance_metric=args.distance_metric,
+            random_edge_probs=args.random_edge_probs,
+            stack_with_np=not args.use_lists,
+        )
+        graph_map_id_start, graph_map_id_end = graph_map_id_bounds(dense_dataset)
+        snapshot_count = len(dense_dataset[0])
+        saved_samples = len(payload["dataset"])
+        entry = write_stage_shard(
+            args,
+            stage_dir_name="processed_dataset",
+            stage="processed",
+            shard_idx=shard_idx,
+            sample_start=payload["sample_start"],
+            sample_end=payload["sample_end"],
+            payload=dense_dataset,
+            saved_samples=saved_samples,
+            snapshot_count=snapshot_count,
+            graph_map_id_start=graph_map_id_start,
+            graph_map_id_end=graph_map_id_end,
+        )
+        entries.append(entry)
+        graph_map_id_offset += saved_samples
+
+    return write_stage_manifest(args, "processed_dataset", "processed", entries)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert to Imitation Learning Dataset"
     )
     parser = add_expert_dataset_args(parser)
     parser = add_imitation_dataset_args(parser)
+    parser = add_sharded_downstream_args(parser)
     parser.add_argument("--use_edge_attr", action="store_true", default=False)
 
     args = parser.parse_args()
-    print(args)
+    logger.info(args)
+
+    if args.use_shards:
+        generate_processed_dataset_shards(args)
+        return
 
     dataset = load_dataset(
         [get_expert_dataset_file_name],
@@ -255,6 +332,9 @@ def main():
         random_edge_probs=args.random_edge_probs,
         stack_with_np=not args.use_lists,
     )
+    logger.info("Releasing raw expert dataset before writing processed dataset.")
+    del dataset
+    gc.collect()
 
     file_name = get_imitation_dataset_file_name(args)
     path = pathlib.Path(f"{args.dataset_dir}", "processed_dataset", f"{file_name}")

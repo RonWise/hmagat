@@ -6,6 +6,7 @@ import wandb
 import time
 import random
 import math
+import queue as queue_module
 
 import multiprocessing as mp
 from itertools import compress
@@ -696,7 +697,7 @@ def main():
                                     if p.exitcode is None:
                                         p.terminate()
                                     break
-                                except:
+                                except queue_module.Empty:
                                     p.join(timeout=0.5)
                                     if p.exitcode is not None:
                                         break

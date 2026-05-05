@@ -1,9 +1,12 @@
 from tqdm import tqdm
 
 import torch
+from loguru import logger
 from torch.utils.data import Dataset
 from torch_geometric.utils import dense_to_sparse, scatter
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
+
+from hmagat.progress_logging import ProgressLogger
 
 
 def convert_dense_graph_dataset_to_sparse_pyg_dataset(dense_dataset):
@@ -65,6 +68,216 @@ def add_additional_data(additional_data, additional_data_idx, index, dtype):
         prev_actions = prev_actions.to(dtype)
         kwargs["prev_actions"] = prev_actions
     return kwargs
+
+
+def group_indices_by_graph_map_id(graph_map_id):
+    if isinstance(graph_map_id, torch.Tensor):
+        graph_map_id = graph_map_id.detach().cpu().tolist()
+
+    groups = []
+    seen_map_ids = set()
+    current_map_id = None
+    current_group = []
+
+    for index, map_id in enumerate(graph_map_id):
+        if isinstance(map_id, torch.Tensor):
+            map_id = map_id.item()
+
+        if current_map_id is None:
+            current_map_id = map_id
+            current_group = [index]
+            seen_map_ids.add(map_id)
+            continue
+
+        if map_id == current_map_id:
+            current_group.append(index)
+            continue
+
+        groups.append(current_group)
+        if map_id in seen_map_ids:
+            raise ValueError(
+                "graph_map_id must be contiguous for sequence grouping; "
+                f"map id {map_id} appears in multiple segments."
+            )
+        seen_map_ids.add(map_id)
+        current_map_id = map_id
+        current_group = [index]
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
+
+
+def _data_num_agents(data):
+    if hasattr(data, "x") and data.x is not None:
+        return data.x.shape[0]
+    if hasattr(data, "num_nodes") and data.num_nodes is not None:
+        return data.num_nodes
+    raise ValueError(
+        "Cannot validate sequence assumptions: snapshot has neither x nor "
+        "num_nodes to infer the number of agents."
+    )
+
+
+def _first_step_value(data):
+    if not hasattr(data, "first_step"):
+        return None
+    first_step = data.first_step
+    if isinstance(first_step, torch.Tensor):
+        return bool(first_step.reshape(-1)[0].item())
+    return bool(first_step)
+
+
+def _agent_id_for_num_agents(num_agents):
+    return torch.arange(num_agents, dtype=torch.long)
+
+
+def validate_sequence_dataset_assumptions(
+    snapshot_dataset,
+    graph_map_id=None,
+    require_agent_id=False,
+    progress_label=None,
+):
+    if graph_map_id is None:
+        if not hasattr(snapshot_dataset, "graph_map_id"):
+            raise ValueError(
+                "graph_map_id must be provided when snapshot_dataset does not "
+                "expose a graph_map_id attribute."
+            )
+        graph_map_id = snapshot_dataset.graph_map_id
+
+    episode_indices = group_indices_by_graph_map_id(graph_map_id)
+    progress = None
+    if progress_label is not None:
+        progress = ProgressLogger(
+            progress_label,
+            len(episode_indices),
+            every_n=max(1, len(episode_indices) // 20) if episode_indices else 1,
+            every_seconds=30.0,
+        )
+    missing_agent_id_warning_emitted = False
+    num_snapshots = 0
+
+    for episode_idx, indices in enumerate(episode_indices):
+        expected_num_agents = None
+        expected_agent_id = None
+        for timestep, snapshot_idx in enumerate(indices):
+            data = snapshot_dataset[snapshot_idx]
+            num_snapshots += 1
+
+            num_agents = _data_num_agents(data)
+            if expected_num_agents is None:
+                expected_num_agents = num_agents
+            elif num_agents != expected_num_agents:
+                raise ValueError(
+                    "Agent row count changed inside one sequence episode: "
+                    f"episode {episode_idx}, snapshot {snapshot_idx}, expected "
+                    f"{expected_num_agents}, got {num_agents}."
+                )
+
+            first_step = _first_step_value(data)
+            if first_step is not None:
+                expected_first_step = timestep == 0
+                if first_step != expected_first_step:
+                    raise ValueError(
+                        "first_step flag is inconsistent with sequence grouping: "
+                        f"episode {episode_idx}, snapshot {snapshot_idx}, "
+                        f"expected {expected_first_step}, got {first_step}."
+                    )
+
+            if hasattr(data, "agent_id"):
+                agent_id = data.agent_id.detach().cpu()
+                if expected_agent_id is None:
+                    expected_agent_id = agent_id
+                elif not torch.equal(agent_id, expected_agent_id):
+                    raise ValueError(
+                        "agent_id order changed inside one sequence episode: "
+                        f"episode {episode_idx}, snapshot {snapshot_idx}."
+                    )
+            elif require_agent_id:
+                raise ValueError(
+                    "Cannot prove stable agent row order: snapshot has no "
+                    "agent_id attribute and require_agent_id=True."
+                )
+            elif not missing_agent_id_warning_emitted:
+                logger.warning(
+                    "Sequence dataset assumption check cannot prove stable agent "
+                    "row order because snapshots have no agent_id attribute; "
+                    "falling back to row-order stability assumption."
+                )
+                missing_agent_id_warning_emitted = True
+        if progress is not None:
+            progress.update(
+                episode_idx + 1,
+                extra=f"snapshots={num_snapshots}",
+            )
+
+    return {
+        "num_episodes": len(episode_indices),
+        "num_snapshots": num_snapshots,
+        "episode_lengths": [len(indices) for indices in episode_indices],
+        "checked_agent_id": not missing_agent_id_warning_emitted,
+    }
+
+
+class MAPFSequenceDataset(Dataset):
+    def __init__(self, snapshot_dataset, graph_map_id=None):
+        self.snapshot_dataset = snapshot_dataset
+        if graph_map_id is None:
+            if not hasattr(snapshot_dataset, "graph_map_id"):
+                raise ValueError(
+                    "graph_map_id must be provided when snapshot_dataset does not "
+                    "expose a graph_map_id attribute."
+                )
+            graph_map_id = snapshot_dataset.graph_map_id
+        self.episode_indices = group_indices_by_graph_map_id(graph_map_id)
+
+    def __len__(self) -> int:
+        return len(self.episode_indices)
+
+    def __getitem__(self, index):
+        return [self.snapshot_dataset[i] for i in self.episode_indices[index]]
+
+
+class MAPFSequenceBatch:
+    def __init__(self, timesteps, active_episode_indices, sequence_lengths):
+        self.timesteps = timesteps
+        self.active_episode_indices = active_episode_indices
+        self.sequence_lengths = sequence_lengths
+
+    def __len__(self):
+        return len(self.timesteps)
+
+
+def collate_mapf_sequences(sequences):
+    if len(sequences) == 0:
+        raise ValueError("Cannot collate an empty sequence batch.")
+
+    sequence_lengths = torch.tensor([len(sequence) for sequence in sequences])
+    max_length = int(torch.max(sequence_lengths).item())
+    if max_length == 0:
+        raise ValueError("Cannot collate sequence batch with no timesteps.")
+
+    timesteps = []
+    active_episode_indices = []
+    for timestep in range(max_length):
+        timestep_items = []
+        active_indices = []
+        for episode_idx, sequence in enumerate(sequences):
+            if timestep >= len(sequence):
+                continue
+            timestep_items.append(sequence[timestep])
+            active_indices.append(episode_idx)
+
+        timesteps.append(Batch.from_data_list(timestep_items))
+        active_episode_indices.append(torch.tensor(active_indices, dtype=torch.long))
+
+    return MAPFSequenceBatch(
+        timesteps=timesteps,
+        active_episode_indices=active_episode_indices,
+        sequence_lengths=sequence_lengths,
+    )
 
 
 class MAPFGraphDataset(Dataset):
@@ -179,7 +392,10 @@ class MAPFGraphDataset(Dataset):
         else:
             first_step = self.graph_map_id[index] != self.graph_map_id[index - 1]
         first_step = torch.BoolTensor([first_step])
-        extra_kwargs = extra_kwargs | {"first_step": first_step}
+        extra_kwargs = extra_kwargs | {
+            "first_step": first_step,
+            "agent_id": _agent_id_for_num_agents(x.shape[0]),
+        }
 
         extra_kwargs = extra_kwargs | add_additional_data(
             additional_data=self.additional_data,
@@ -310,7 +526,10 @@ class MAPFHypergraphDataset(Dataset):
         else:
             first_step = self.graph_map_id[index] != self.graph_map_id[index - 1]
         first_step = torch.BoolTensor([first_step])
-        extra_kwargs = extra_kwargs | {"first_step": first_step}
+        extra_kwargs = extra_kwargs | {
+            "first_step": first_step,
+            "agent_id": _agent_id_for_num_agents(x.shape[0]),
+        }
 
         extra_kwargs = extra_kwargs | add_additional_data(
             additional_data=self.additional_data,

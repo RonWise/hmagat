@@ -7,6 +7,7 @@ from scipy import sparse
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction import grid_to_graph
 import pyamg
+from loguru import logger
 
 from pibt.pypibt.dist_table import DistTable
 
@@ -582,10 +583,13 @@ class LloydsHyperedgeGenerator(kMeansHyperedgeGenerator):
             cols, centres = pyamg.graph.balanced_lloyd_cluster(
                 mat, centers=num_colours, maxiter=self.num_updates
             )
-        except:
+        except Exception as exc:
             # Fallback to unbalanced Lloyd's clustering
             # (likely due to unconnected components)
-            print("Falling back to unbalanced Lloyd's clustering.")
+            logger.warning(
+                "Falling back to unbalanced Lloyd's clustering after balanced "
+                f"Lloyd clustering failed: {exc}."
+            )
             cols, centres = pyamg.graph.lloyd_cluster(
                 mat, centers=num_colours, maxiter=self.num_updates
             )

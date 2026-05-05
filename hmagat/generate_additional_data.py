@@ -3,11 +3,20 @@ import pickle
 import pathlib
 import numpy as np
 import torch
+from loguru import logger
 
 from pogema import pogema_v0
 
 from hmagat.run_expert import get_expert_dataset_file_name, add_expert_dataset_args
 from hmagat.dataset_loading import load_dataset
+from hmagat.downstream_shards import (
+    add_sharded_downstream_args,
+    iter_raw_expert_shards,
+    successful_shard_seeds,
+    write_stage_manifest,
+    write_stage_shard,
+)
+from hmagat.progress_logging import ProgressLogger
 
 from grid_config_generator import grid_config_generator_factory
 
@@ -148,13 +157,77 @@ def generate_additional_data(
     return all_additional_data
 
 
+def generate_additional_data_for_dataset(args, dataset, seeds, print_prefix=""):
+    _grid_config_generator = grid_config_generator_factory(args)
+
+    all_additional_data = []
+    total_samples = len(dataset)
+    progress = ProgressLogger(
+        f"{print_prefix}Additional data generation".strip(),
+        total_samples,
+        every_n=max(1, total_samples // 100),
+        every_seconds=30.0,
+        requested_total=args.num_samples,
+    )
+    for sample_num, (seed, data) in enumerate(zip(seeds, dataset)):
+        grid_config = _grid_config_generator(seed)
+        _, all_actions, _ = data
+
+        additional_data = generate_additional_data(
+            grid_config=grid_config,
+            all_actions=all_actions,
+            num_previous_actions=args.add_data_num_previous_actions,
+            cost_to_go=args.add_data_cost_to_go,
+            normalized_cost_to_go=args.normalize_cost_to_go,
+            greedy_action=args.add_data_greedy_action,
+            clamp_value=args.clamp_cost_to_go,
+            clamped_values_doubled=args.clamped_values_doubled,
+        )
+        all_additional_data.extend(additional_data)
+        progress.update(
+            sample_num + 1,
+            extra=f"snapshots={len(all_additional_data)}",
+        )
+    return all_additional_data
+
+
+def generate_additional_data_shards(args):
+    entries = []
+    for shard_idx, record in enumerate(iter_raw_expert_shards(args)):
+        payload = record["payload"]
+        additional_data = generate_additional_data_for_dataset(
+            args,
+            payload["dataset"],
+            successful_shard_seeds(args, payload),
+            print_prefix=f"Additional data shard {shard_idx}: ",
+        )
+        entry = write_stage_shard(
+            args,
+            stage_dir_name="additional_data",
+            stage="additional_data",
+            shard_idx=shard_idx,
+            sample_start=payload["sample_start"],
+            sample_end=payload["sample_end"],
+            payload=additional_data,
+            saved_samples=len(payload["dataset"]),
+            snapshot_count=len(additional_data),
+        )
+        entries.append(entry)
+    return write_stage_manifest(args, "additional_data", "additional_data", entries)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate Additional Data")
     parser = add_expert_dataset_args(parser)
     parser = add_additional_data_args(parser)
+    parser = add_sharded_downstream_args(parser)
 
     args = parser.parse_args()
-    print(args)
+    logger.info(args)
+
+    if args.use_shards:
+        generate_additional_data_shards(args)
+        return
 
     dataset = load_dataset(
         [get_expert_dataset_file_name],
@@ -171,25 +244,7 @@ def main():
     elif not args.take_all_seeds:
         raise ValueError("Dataset is expected to have a seed_mask.")
 
-    _grid_config_generator = grid_config_generator_factory(args)
-
-    all_additional_data = []
-    for sample_num, (seed, data) in enumerate(zip(seeds, dataset)):
-        print(f"Generating Additional Data for map {sample_num + 1}/{args.num_samples}")
-        grid_config = _grid_config_generator(seed)
-        _, all_actions, _ = data
-
-        additional_data = generate_additional_data(
-            grid_config=grid_config,
-            all_actions=all_actions,
-            num_previous_actions=args.add_data_num_previous_actions,
-            cost_to_go=args.add_data_cost_to_go,
-            normalized_cost_to_go=args.normalize_cost_to_go,
-            greedy_action=args.add_data_greedy_action,
-            clamp_value=args.clamp_cost_to_go,
-            clamped_values_doubled=args.clamped_values_doubled,
-        )
-        all_additional_data.extend(additional_data)
+    all_additional_data = generate_additional_data_for_dataset(args, dataset, seeds)
 
     file_name = get_additional_data_file_name(args)
     path = pathlib.Path(args.dataset_dir, "additional_data", file_name)

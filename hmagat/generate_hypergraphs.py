@@ -3,11 +3,20 @@ import pickle
 import pathlib
 import numpy as np
 import time
+from loguru import logger
 
 from pogema import pogema_v0
 
 from hmagat.run_expert import get_expert_dataset_file_name, add_expert_dataset_args
 from hmagat.dataset_loading import load_dataset
+from hmagat.downstream_shards import (
+    add_sharded_downstream_args,
+    iter_raw_expert_shards,
+    successful_shard_seeds,
+    write_stage_manifest,
+    write_stage_shard,
+)
+from hmagat.progress_logging import ProgressLogger
 
 from grid_config_generator import grid_config_generator_factory
 
@@ -173,27 +182,7 @@ def get_hypergraph_indices_generator(
     return generator
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate Hypergraphs")
-    parser = add_expert_dataset_args(parser)
-    parser = add_hypergraph_generation_args(parser)
-
-    args = parser.parse_args()
-    print(args)
-
-    dataset = load_dataset(
-        [get_expert_dataset_file_name], "raw_expert_predictions", args
-    )
-
-    rng = np.random.default_rng(args.dataset_seed)
-    seeds = rng.integers(10**10, size=args.num_samples)
-
-    if isinstance(dataset, tuple):
-        dataset, seed_mask = dataset
-        seeds = seeds[seed_mask]
-    elif not args.take_all_seeds:
-        raise ValueError("Dataset is expected to have a seed_mask.")
-
+def generate_hypergraphs_for_dataset(args, dataset, seeds, print_prefix=""):
     _grid_config_generator = grid_config_generator_factory(args)
 
     hyperedge_generator = get_hypergraph_indices_generator(
@@ -215,8 +204,15 @@ def main():
 
     all_ntoh = []
     all_hton_index = []
+    total_samples = len(dataset)
+    progress = ProgressLogger(
+        f"{print_prefix}Hypergraph generation".strip(),
+        total_samples,
+        every_n=max(1, total_samples // 100),
+        every_seconds=30.0,
+        requested_total=args.num_samples,
+    )
     for sample_num, (seed, data) in enumerate(zip(seeds, dataset)):
-        print(f"Generating Hypergraph for map {sample_num + 1}/{args.num_samples}")
         grid_config = _grid_config_generator(seed)
 
         env = pogema_v0(grid_config)
@@ -231,7 +227,66 @@ def main():
             all_ntoh.append(ntoh_index)
             all_hton_index.append(hton_index)
             env.step(actions)
-    all_hypergraphs = (all_ntoh, all_hton_index)
+        progress.update(
+            sample_num + 1,
+            extra=f"snapshots={len(all_ntoh)}",
+        )
+    return all_ntoh, all_hton_index
+
+
+def generate_hypergraph_shards(args):
+    entries = []
+    for shard_idx, record in enumerate(iter_raw_expert_shards(args)):
+        payload = record["payload"]
+        hypergraphs = generate_hypergraphs_for_dataset(
+            args,
+            payload["dataset"],
+            successful_shard_seeds(args, payload),
+            print_prefix=f"Hypergraph shard {shard_idx}: ",
+        )
+        snapshot_count = len(hypergraphs[0])
+        entry = write_stage_shard(
+            args,
+            stage_dir_name="hypergraphs",
+            stage="hypergraphs",
+            shard_idx=shard_idx,
+            sample_start=payload["sample_start"],
+            sample_end=payload["sample_end"],
+            payload=hypergraphs,
+            saved_samples=len(payload["dataset"]),
+            snapshot_count=snapshot_count,
+        )
+        entries.append(entry)
+    return write_stage_manifest(args, "hypergraphs", "hypergraphs", entries)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate Hypergraphs")
+    parser = add_expert_dataset_args(parser)
+    parser = add_hypergraph_generation_args(parser)
+    parser = add_sharded_downstream_args(parser)
+
+    args = parser.parse_args()
+    logger.info(args)
+
+    if args.use_shards:
+        generate_hypergraph_shards(args)
+        return
+
+    dataset = load_dataset(
+        [get_expert_dataset_file_name], "raw_expert_predictions", args
+    )
+
+    rng = np.random.default_rng(args.dataset_seed)
+    seeds = rng.integers(10**10, size=args.num_samples)
+
+    if isinstance(dataset, tuple):
+        dataset, seed_mask = dataset
+        seeds = seeds[seed_mask]
+    elif not args.take_all_seeds:
+        raise ValueError("Dataset is expected to have a seed_mask.")
+
+    all_hypergraphs = generate_hypergraphs_for_dataset(args, dataset, seeds)
 
     file_name = get_hypergraph_file_name(args)
     path = pathlib.Path(f"{args.dataset_dir}", "hypergraphs", f"{file_name}")

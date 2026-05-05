@@ -5,6 +5,7 @@ import numpy as np
 import wandb
 import time
 import random
+import queue as queue_module
 
 import multiprocessing as mp
 from itertools import compress
@@ -12,9 +13,12 @@ from collections import OrderedDict
 
 import torch
 import torch.optim as optim
+from loguru import logger
 
+from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.loader import DataLoader
 
+from hmagat.downstream_shards import add_sharded_downstream_args
 from hmagat.training_args import add_training_args
 from hmagat.convert_to_imitation_dataset import (
     add_imitation_dataset_args,
@@ -35,6 +39,14 @@ from hmagat.run_expert import (
 from hmagat.imitation_dataset_pyg import (
     MAPFGraphDataset,
     MAPFHypergraphDataset,
+    MAPFSequenceDataset,
+    collate_mapf_sequences,
+    validate_sequence_dataset_assumptions,
+)
+from hmagat.sequence_training import compute_sequence_loss
+from hmagat.sharded_training_dataset import (
+    ShardedEpisodeSampler,
+    build_sharded_snapshot_datasets,
 )
 
 from hmagat.modules.model.run_model import run_model_on_grid
@@ -56,6 +68,7 @@ from hmagat.generate_expert_makespans import check_or_create_expert_makespans
 
 from hmagat.lr_scheduler import get_lr_scheduler
 from hmagat.dataset_loading import load_dataset
+from hmagat.progress_logging import ProgressLogger
 
 
 class HyperedgeIndicesGenerator:
@@ -135,6 +148,57 @@ def aux_func_train(env, observations, actions, oe_period=None, **kwargs):
             aux_func_train.grid_configs.append(generate_grid_config_from_env(env))
 
 
+def _effective_num_batches(total_batches, max_batches):
+    if max_batches is None:
+        return total_batches
+    return min(total_batches, max_batches)
+
+
+def _batch_limit_reached(processed_batches, max_batches):
+    return max_batches is not None and processed_batches >= max_batches
+
+
+def _validate_positive_batch_limit(value, arg_name):
+    if value is None:
+        return
+    if value <= 0:
+        logger.warning(f"{arg_name} must be positive when set; got {value}.")
+        raise ValueError(f"{arg_name} must be positive when set")
+
+
+def _validate_and_warn_batch_limits(args):
+    _validate_positive_batch_limit(args.max_train_batches, "--max_train_batches")
+    _validate_positive_batch_limit(
+        args.max_validation_batches, "--max_validation_batches"
+    )
+
+    if args.max_train_batches is not None:
+        logger.warning(
+            "Limiting training to first "
+            f"{args.max_train_batches} batches per epoch because "
+            "--max_train_batches was set. This is a pilot/debug mode and "
+            "must not be reported as full-dataset training."
+        )
+        if args.run_online_expert:
+            logger.warning(
+                "--max_train_batches does not limit online expert augmentation "
+                "batches; disable --run_online_expert for pilot runs."
+            )
+
+    if args.max_validation_batches is not None:
+        logger.warning(
+            "Limiting validation accuracy to first "
+            f"{args.max_validation_batches} batches because "
+            "--max_validation_batches was set. This is a pilot/debug mode and "
+            "must not be reported as full validation accuracy."
+        )
+        if args.skip_validation or args.skip_validation_accuracy:
+            logger.warning(
+                f"--max_validation_batches={args.max_validation_batches} has no "
+                "effect because validation accuracy is disabled."
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train imitation learning model.")
     parser = add_expert_dataset_args(parser)
@@ -142,12 +206,14 @@ def main():
     parser = add_hypergraph_generation_args(parser)
     parser = add_additional_data_args(parser)
     parser = add_training_args(parser)
+    parser = add_sharded_downstream_args(parser)
 
     parser.add_argument("--wandb_project", type=str, default="hyper-mapf-train")
     parser.add_argument("--wandb_entity", type=str, default=None)
 
     args = parser.parse_args()
     print(args)
+    _validate_and_warn_batch_limits(args)
 
     assert args.save_termination_state
     assert args.train_on_terminated_agents
@@ -174,7 +240,11 @@ def main():
     np.random.seed(args.model_seed)
     random.seed(args.model_seed)
 
-    from hmagat.modules.agents import get_model, load_partial_state_dict
+    from hmagat.modules.agents import (
+        get_model,
+        load_partial_state_dict,
+        validate_partial_load_compatibility,
+    )
 
     model, hypergraph_model, dataset_kwargs = get_model(args, device)
 
@@ -182,37 +252,127 @@ def main():
         model.parameters(), lr=args.lr_start, weight_decay=args.weight_decay
     )
 
-    dense_dataset = None
-    hyper_edge_indices = None
-    additional_data = None
-
-    # TODO: Update the dataset loading for all functions
-    print("Loading Dataset.............")
-    dense_dataset = load_dataset(
-        [get_imitation_dataset_file_name],
-        "processed_dataset",
-        args,
+    load_additional_data, additional_data_idx = any_additional_data(args)
+    common_dataset_kwargs = dict(
+        edge_attr_opts=args.edge_attr_opts,
+        additional_data_idx=additional_data_idx,
+        **dataset_kwargs,
     )
-    if args.load_positions_separately:
-        print("Loading Agent Positions.....")
-        agent_pos = load_dataset(
-            [get_pos_file_name],
-            "positions",
+
+    if args.use_shards:
+        logger.info("Loading sharded training datasets.")
+        train_dataset, validation_dataset, train_id_max, validation_id_max = (
+            build_sharded_snapshot_datasets(
+                args,
+                hypergraph_model=hypergraph_model,
+                additional_data_idx=additional_data_idx,
+                dataset_kwargs=common_dataset_kwargs,
+            )
+        )
+    else:
+        dense_dataset = None
+        hyper_edge_indices = None
+        additional_data = None
+
+        print("Loading Dataset.............")
+        dense_dataset = load_dataset(
+            [get_imitation_dataset_file_name],
+            "processed_dataset",
             args,
         )
-        dense_dataset = (*dense_dataset, agent_pos)
-    if hypergraph_model:
-        print("Loading Hypergraphs.........")
-        hyper_edge_indices = load_dataset(
-            [get_hypergraph_file_name], "hypergraphs", args
-        )
+        if args.load_positions_separately:
+            print("Loading Agent Positions.....")
+            agent_pos = load_dataset(
+                [get_pos_file_name],
+                "positions",
+                args,
+            )
+            dense_dataset = (*dense_dataset, agent_pos)
+        if hypergraph_model:
+            print("Loading Hypergraphs.........")
+            hyper_edge_indices = load_dataset(
+                [get_hypergraph_file_name], "hypergraphs", args
+            )
 
-    load_additional_data, additional_data_idx = any_additional_data(args)
-    if load_additional_data:
-        print("Loading Additional Data.....")
-        additional_data = load_dataset(
-            [get_additional_data_file_name], "additional_data", args
+        if load_additional_data:
+            print("Loading Additional Data.....")
+            additional_data = load_dataset(
+                [get_additional_data_file_name], "additional_data", args
+            )
+
+        unique_map_ids = np.sort(np.unique(dense_dataset[4]))
+        num_samples = len(unique_map_ids)
+
+        # Data split
+        train_id_max = int(
+            num_samples * (1 - args.validation_fraction - args.test_fraction)
         )
+        validation_id_max = train_id_max + int(num_samples * args.validation_fraction)
+
+        train_id_max = min(train_id_max, num_samples)
+        train_id_max = unique_map_ids[train_id_max]
+
+        validation_id_max = min(validation_id_max, num_samples)
+        validation_id_max = unique_map_ids[validation_id_max]
+
+        def _divide_dataset(start, end):
+            map_ids = dense_dataset[4]
+            if not isinstance(map_ids, torch.Tensor):
+                map_ids = torch.from_numpy(np.array(map_ids))
+            mask = torch.logical_and(map_ids >= start, map_ids < end)
+            hindices, add_data = None, None
+            if hyper_edge_indices is not None:
+                hindices, hton_indices = hyper_edge_indices
+                hindices = list(compress(hindices, mask))
+                hton_indices = list(compress(hton_indices, mask))
+                hindices = (hindices, hton_indices)
+            if additional_data is not None:
+                add_data = list(compress(additional_data, mask))
+            if isinstance(dense_dataset[0], torch.Tensor):
+                ds = tuple(gd[mask] for gd in dense_dataset)
+            else:
+                ds = tuple(list(compress(gd, mask)) for gd in dense_dataset)
+            return (
+                ds,
+                hindices,
+                add_data,
+            )
+
+        (train_dataset, train_hindices, train_additional_data) = _divide_dataset(
+            0, train_id_max
+        )
+        (validation_dataset, validation_hindices, validation_additional_data) = (
+            _divide_dataset(train_id_max, validation_id_max)
+        )
+        # test_dataset = _divide_dataset(validation_id_max, torch.inf)
+
+        train_kwargs = dict(additional_data=train_additional_data)
+        validation_kwargs = dict(additional_data=validation_additional_data)
+
+        if hypergraph_model:
+            train_dataset = MAPFHypergraphDataset(
+                train_dataset,
+                train_hindices,
+                **train_kwargs,
+                **common_dataset_kwargs,
+            )
+            validation_dataset = MAPFHypergraphDataset(
+                validation_dataset,
+                validation_hindices,
+                **validation_kwargs,
+                **common_dataset_kwargs,
+            )
+        else:
+            train_dataset = MAPFGraphDataset(
+                train_dataset,
+                **train_kwargs,
+                **common_dataset_kwargs,
+            )
+            validation_dataset = MAPFGraphDataset(
+                validation_dataset,
+                **validation_kwargs,
+                **common_dataset_kwargs,
+            )
 
     expert_makespans = None
     if args.oe_improve_quality:
@@ -229,86 +389,57 @@ def main():
             entity=args.wandb_entity,
         )
 
-    unique_map_ids = np.sort(np.unique(dense_dataset[4]))
-    num_samples = len(unique_map_ids)
-
-    # Data split
-    train_id_max = int(
-        num_samples * (1 - args.validation_fraction - args.test_fraction)
-    )
-    validation_id_max = train_id_max + int(num_samples * args.validation_fraction)
-
-    train_id_max = min(train_id_max, num_samples)
-    train_id_max = unique_map_ids[train_id_max]
-
-    validation_id_max = min(validation_id_max, num_samples)
-    validation_id_max = unique_map_ids[validation_id_max]
-
-    def _divide_dataset(start, end):
-        map_ids = dense_dataset[4]
-        if not isinstance(map_ids, torch.Tensor):
-            map_ids = torch.from_numpy(np.array(map_ids))
-        mask = torch.logical_and(map_ids >= start, map_ids < end)
-        hindices, add_data = None, None
-        if hyper_edge_indices is not None:
-            hindices, hton_indices = hyper_edge_indices
-            hindices = list(compress(hindices, mask))
-            hton_indices = list(compress(hton_indices, mask))
-            hindices = (hindices, hton_indices)
-        if additional_data is not None:
-            add_data = list(compress(additional_data, mask))
-        if isinstance(dense_dataset[0], torch.Tensor):
-            ds = tuple(gd[mask] for gd in dense_dataset)
+    if args.sequence_training:
+        if args.validate_sequence_training_dataset:
+            validate_sequence_dataset_assumptions(
+                train_dataset,
+                progress_label="Training sequence dataset preflight",
+            )
+            validate_sequence_dataset_assumptions(
+                validation_dataset,
+                progress_label="Validation sequence dataset preflight",
+            )
         else:
-            ds = tuple(list(compress(gd, mask)) for gd in dense_dataset)
-        return (
-            ds,
-            hindices,
-            add_data,
+            logger.warning(
+                "Skipping sequence training dataset assumption checks because "
+                "--no-validate_sequence_training_dataset was set. Run "
+                "audit_sequence_dataset --use_shards before full training."
+            )
+        train_sequence_dataset = MAPFSequenceDataset(train_dataset)
+        validation_sequence_dataset = MAPFSequenceDataset(validation_dataset)
+        logger.info(
+            "Training sequence datasets prepared: "
+            f"train_episodes={len(train_sequence_dataset)}, "
+            f"validation_episodes={len(validation_sequence_dataset)}, "
+            f"train_snapshots={len(train_dataset)}, "
+            f"validation_snapshots={len(validation_dataset)}"
         )
-
-    (train_dataset, train_hindices, train_additional_data) = _divide_dataset(
-        0, train_id_max
-    )
-    (validation_dataset, validation_hindices, validation_additional_data) = (
-        _divide_dataset(train_id_max, validation_id_max)
-    )
-    # test_dataset = _divide_dataset(validation_id_max, torch.inf)
-
-    common_dataset_kwargs = dict(
-        edge_attr_opts=args.edge_attr_opts,
-        additional_data_idx=additional_data_idx,
-        **dataset_kwargs,
-    )
-
-    train_kwargs = dict(additional_data=train_additional_data)
-    validation_kwargs = dict(additional_data=validation_additional_data)
-
-    if hypergraph_model:
-        train_dataset = MAPFHypergraphDataset(
-            train_dataset,
-            train_hindices,
-            **train_kwargs,
-            **common_dataset_kwargs,
-        )
-        validation_dataset = MAPFHypergraphDataset(
-            validation_dataset,
-            validation_hindices,
-            **validation_kwargs,
-            **common_dataset_kwargs,
+        train_dl = TorchDataLoader(
+            train_sequence_dataset,
+            batch_size=args.batch_size,
+            shuffle=not args.use_shards,
+            sampler=(
+                ShardedEpisodeSampler(train_dataset, shuffle=True)
+                if args.use_shards
+                else None
+            ),
+            collate_fn=collate_mapf_sequences,
         )
     else:
-        train_dataset = MAPFGraphDataset(
-            train_dataset,
-            **train_kwargs,
-            **common_dataset_kwargs,
+        logger.info(
+            "Training snapshot datasets prepared: "
+            f"train_snapshots={len(train_dataset)}, "
+            f"validation_snapshots={len(validation_dataset)}"
         )
-        validation_dataset = MAPFGraphDataset(
-            validation_dataset,
-            **validation_kwargs,
-            **common_dataset_kwargs,
+        train_dl = DataLoader(train_dataset, batch_size=args.batch_size)
+    if args.sequence_training:
+        validation_sequence_dl = TorchDataLoader(
+            validation_sequence_dataset,
+            batch_size=args.batch_size,
+            collate_fn=collate_mapf_sequences,
         )
-    train_dl = DataLoader(train_dataset, batch_size=args.batch_size)
+    else:
+        validation_sequence_dl = None
     validation_dl = DataLoader(validation_dataset, batch_size=args.batch_size)
 
     if expert_makespans is not None:
@@ -383,7 +514,12 @@ def main():
         print("Partially Loading Weights.............")
         partial_path = pathlib.Path(args.load_partial_parameters_path)
         state_dict = torch.load(partial_path, map_location=device)
-        load_partial_state_dict(model, state_dict, print_prefix="[partial-load]")
+        summary = load_partial_state_dict(
+            model, state_dict, print_prefix="[partial-load]"
+        )
+        validate_partial_load_compatibility(
+            summary, print_prefix="[partial-load]"
+        )
 
     queue = mp.Queue()
     done_event = mp.Event()
@@ -398,28 +534,82 @@ def main():
         n_maps = 0
 
         model = model.train()
-        for data in train_dl:
-            data = data.to(device)
-            optimizer.zero_grad()
+        train_progress = ProgressLogger(
+            f"Training epoch {epoch}",
+            _effective_num_batches(len(train_dl), args.max_train_batches),
+            every_n=max(
+                1,
+                _effective_num_batches(len(train_dl), args.max_train_batches) // 20,
+            ),
+            every_seconds=30.0,
+        )
+        if args.sequence_training:
+            for batch_idx, sequence_batch in enumerate(train_dl):
+                optimizer.zero_grad()
 
-            out = model(data.x, data)
-            loss = loss_function(out, data, model)
-            total_loss += loss.item()
+                def accumulate_step_metrics(out, data):
+                    nonlocal accuracies, num_samples, n_graphs, n_maps
+                    new_acc = loss_function.get_accuracies(out, data, model)
+                    if accuracies is None:
+                        accuracies = new_acc
+                    else:
+                        for key in accuracies:
+                            accuracies[key] += new_acc[key]
+                    num_samples += data.x.shape[0]
+                    n_graphs += len(data.ptr) - 1
+                    n_maps += torch.sum(data.first_step).cpu().item()
 
-            loss.backward()
-            optimizer.step()
+                loss = compute_sequence_loss(
+                    model,
+                    sequence_batch,
+                    loss_function,
+                    device=device,
+                    detach_state=args.sequence_detach_state,
+                    truncated_bptt_length=args.truncated_bptt_length,
+                    on_step=accumulate_step_metrics,
+                )
+                total_loss += loss.item()
 
-            new_acc = loss_function.get_accuracies(out, data, model)
-            if accuracies is None:
-                accuracies = new_acc
-            else:
-                for key in accuracies:
-                    accuracies[key] += new_acc[key]
-            num_samples += data.x.shape[0]
-            n_batches += 1
-            n_graphs += len(data.ptr) - 1
-            n_maps += torch.sum(data.first_step).cpu().item()
-            lr_scheduler.step_on_batch()
+                loss.backward()
+                optimizer.step()
+
+                n_batches += 1
+                lr_scheduler.step_on_batch()
+                train_progress.update(
+                    batch_idx + 1,
+                    extra=f"loss={loss.item():.6f}",
+                )
+                if _batch_limit_reached(batch_idx + 1, args.max_train_batches):
+                    break
+        else:
+            for batch_idx, data in enumerate(train_dl):
+                data = data.to(device)
+                optimizer.zero_grad()
+
+                out = model(data.x, data)
+                loss = loss_function(out, data, model)
+                total_loss += loss.item()
+
+                loss.backward()
+                optimizer.step()
+
+                new_acc = loss_function.get_accuracies(out, data, model)
+                if accuracies is None:
+                    accuracies = new_acc
+                else:
+                    for key in accuracies:
+                        accuracies[key] += new_acc[key]
+                num_samples += data.x.shape[0]
+                n_batches += 1
+                n_graphs += len(data.ptr) - 1
+                n_maps += torch.sum(data.first_step).cpu().item()
+                lr_scheduler.step_on_batch()
+                train_progress.update(
+                    batch_idx + 1,
+                    extra=f"loss={loss.item():.6f}",
+                )
+                if _batch_limit_reached(batch_idx + 1, args.max_train_batches):
+                    break
 
         if oe_graph_dataset is not None:
             oe_dataset_kwargs = dict(additional_data=oe_additional_data)
@@ -498,21 +688,92 @@ def main():
                 n_maps = 0
 
                 with torch.no_grad():
-                    for data in validation_dl:
-                        data = data.to(device)
-                        out = model(data.x, data)
-                        new_acc = loss_function.get_accuracies(
-                            out, data, model, "validation"
+                    if args.sequence_training:
+                        validation_progress = ProgressLogger(
+                            f"Validation accuracy epoch {epoch}",
+                            _effective_num_batches(
+                                len(validation_sequence_dl),
+                                args.max_validation_batches,
+                            ),
+                            every_n=max(
+                                1,
+                                _effective_num_batches(
+                                    len(validation_sequence_dl),
+                                    args.max_validation_batches,
+                                )
+                                // 20,
+                            ),
+                            every_seconds=30.0,
                         )
+                        for batch_idx, sequence_batch in enumerate(validation_sequence_dl):
 
-                        if val_accuracies is None:
-                            val_accuracies = new_acc
-                        else:
-                            for key in val_accuracies:
-                                val_accuracies[key] += new_acc[key]
-                        val_samples += data.x.shape[0]
-                        n_graphs += len(data.ptr) - 1
-                        n_maps += torch.sum(data.first_step).cpu().item()
+                            def accumulate_validation_metrics(out, data):
+                                nonlocal val_accuracies, val_samples, n_graphs, n_maps
+                                new_acc = loss_function.get_accuracies(
+                                    out, data, model, "validation"
+                                )
+
+                                if val_accuracies is None:
+                                    val_accuracies = new_acc
+                                else:
+                                    for key in val_accuracies:
+                                        val_accuracies[key] += new_acc[key]
+                                val_samples += data.x.shape[0]
+                                n_graphs += len(data.ptr) - 1
+                                n_maps += torch.sum(data.first_step).cpu().item()
+
+                            compute_sequence_loss(
+                                model,
+                                sequence_batch,
+                                loss_function,
+                                device=device,
+                                detach_state=True,
+                                on_step=accumulate_validation_metrics,
+                            )
+                            validation_progress.update(batch_idx + 1)
+                            if _batch_limit_reached(
+                                batch_idx + 1,
+                                args.max_validation_batches,
+                            ):
+                                break
+                    else:
+                        validation_progress = ProgressLogger(
+                            f"Validation accuracy epoch {epoch}",
+                            _effective_num_batches(
+                                len(validation_dl),
+                                args.max_validation_batches,
+                            ),
+                            every_n=max(
+                                1,
+                                _effective_num_batches(
+                                    len(validation_dl),
+                                    args.max_validation_batches,
+                                )
+                                // 20,
+                            ),
+                            every_seconds=30.0,
+                        )
+                        for batch_idx, data in enumerate(validation_dl):
+                            data = data.to(device)
+                            out = model(data.x, data)
+                            new_acc = loss_function.get_accuracies(
+                                out, data, model, "validation"
+                            )
+
+                            if val_accuracies is None:
+                                val_accuracies = new_acc
+                            else:
+                                for key in val_accuracies:
+                                    val_accuracies[key] += new_acc[key]
+                            val_samples += data.x.shape[0]
+                            n_graphs += len(data.ptr) - 1
+                            n_maps += torch.sum(data.first_step).cpu().item()
+                            validation_progress.update(batch_idx + 1)
+                            if _batch_limit_reached(
+                                batch_idx + 1,
+                                args.max_validation_batches,
+                            ):
+                                break
                 for key in val_accuracies:
                     if "first_step_first_agent" in key:
                         val_accuracies[key] = val_accuracies[key] / n_maps
@@ -540,6 +801,7 @@ def main():
                     args=args,
                     dataset_kwargs=dataset_kwargs,
                     hypergraph_model=hypergraph_model,
+                    use_target_vec=args.use_target_vec,
                     aux_func=aux_func,
                 )
 
@@ -633,6 +895,7 @@ def main():
                         args=args,
                         dataset_kwargs=dataset_kwargs,
                         hypergraph_model=hypergraph_model,
+                        use_target_vec=args.use_target_vec,
                         max_episodes=args.max_episode_steps,
                         aux_func=aux_func_train if oe_improve_quality else None,
                     )
@@ -709,7 +972,7 @@ def main():
                                         if p.exitcode is None:
                                             p.terminate()
                                         break
-                                    except:
+                                    except queue_module.Empty:
                                         p.join(timeout=0.5)
                                         if p.exitcode is not None:
                                             break

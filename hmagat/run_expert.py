@@ -1,9 +1,11 @@
 import argparse
 import pickle
 import pathlib
-import numpy as np
+from loguru import logger
 
 from pogema import pogema_v0, GridConfig
+
+from hmagat.progress_logging import ProgressLogger
 
 from grid_config_generator import add_grid_config_args, grid_config_generator_factory
 
@@ -128,6 +130,9 @@ def add_expert_dataset_args(parser):
     )
 
     parser.add_argument("--override_name", type=str, default=None)
+    parser.add_argument("--sample_start", type=int, default=None)
+    parser.add_argument("--sample_end", type=int, default=None)
+    parser.add_argument("--shard_output_name", type=str, default=None)
 
     return parser
 
@@ -240,7 +245,12 @@ def get_expert_algorithm_and_config(args):
             elif len(gpt_args) == 1:
                 try:
                     sampling_temperature = float(gpt_args[0])
-                except:
+                except ValueError as exc:
+                    logger.warning(
+                        "Expert algorithm argument fallback: could not parse "
+                        f"{gpt_args[0]!r} as sampling temperature ({exc}); "
+                        "using it as model weight."
+                    )
                     model_weight = gpt_args[0]
             elif len(gpt_args) > 2:
                 raise ValueError(
@@ -322,13 +332,26 @@ def main():
     parser = add_expert_dataset_args(parser)
 
     args = parser.parse_args()
-    print(args)
+    logger.info(args)
+
+    from hmagat.expert_shards import (
+        build_global_seeds,
+        default_shard_output_name,
+        is_shard_mode,
+        validate_sample_range,
+        write_expert_shard,
+    )
 
     if args.map_dir is not None:
         assert args.maps_name is not None
 
-    rng = np.random.default_rng(args.dataset_seed)
-    seeds = rng.integers(10**10, size=args.num_samples)
+    seeds = build_global_seeds(args.dataset_seed, args.num_samples)
+    sample_start, sample_end = validate_sample_range(
+        args.sample_start,
+        args.sample_end,
+        args.num_samples,
+    )
+    seeds = seeds[sample_start:sample_end]
 
     _grid_config_generator = grid_config_generator_factory(args)
 
@@ -337,9 +360,19 @@ def main():
     dataset = []
     seed_mask = []
     num_success = 0
+    shard_mode = is_shard_mode(args)
+    progress_label = "Expert generation"
+    if shard_mode:
+        progress_label += f" shard [{sample_start}, {sample_end})"
+    progress = ProgressLogger(
+        progress_label,
+        len(seeds),
+        every_n=1,
+        every_seconds=30.0,
+        requested_total=args.num_samples if shard_mode else None,
+    )
     for i, seed in enumerate(seeds):
         grid_config = _grid_config_generator(seed)
-        print(f"Running expert on map {i + 1}/{args.num_samples}", end=" ")
         expert = expert_algorithm(inference_config)
 
         all_actions, all_observations, all_terminated = run_expert_algorithm(
@@ -358,16 +391,40 @@ def main():
         else:
             seed_mask.append(False)
 
-        print(f"-- Success Rate: {num_success / (i + 1)}")
+        progress.update(
+            i + 1,
+            extra=(
+                f"global_sample={sample_start + i}, "
+                f"success_rate={num_success / (i + 1):.6f}, "
+                f"last_success={seed_mask[-1]}, saved_samples={len(dataset)}"
+            ),
+        )
 
-    print(f"{len(dataset)}/{len(seeds)} samples were successfully added to the dataset")
+    logger.info(
+        f"{len(dataset)}/{len(seeds)} samples were successfully added to the dataset"
+    )
 
-    file_name = get_expert_dataset_file_name(args)
-    path = pathlib.Path(f"{args.dataset_dir}", "raw_expert_predictions", f"{file_name}")
+    if shard_mode:
+        shard_output_name = args.shard_output_name
+        if shard_output_name is None:
+            shard_output_name = default_shard_output_name(args, sample_start, sample_end)
+        write_expert_shard(
+            args,
+            dataset=dataset,
+            seed_mask=seed_mask,
+            sample_start=sample_start,
+            sample_end=sample_end,
+            shard_output_name=shard_output_name,
+        )
+    else:
+        file_name = get_expert_dataset_file_name(args)
+        path = pathlib.Path(
+            f"{args.dataset_dir}", "raw_expert_predictions", f"{file_name}"
+        )
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump((dataset, seed_mask), f)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump((dataset, seed_mask), f)
 
 
 if __name__ == "__main__":

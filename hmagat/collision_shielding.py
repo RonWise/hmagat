@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+from loguru import logger
 
 from pibt.pypibt.pibt import PIBT
 from hmagat.utils import get_neighbors
@@ -152,8 +153,12 @@ class PIBTInstance(PIBT):
                 ids = self.rng.choice(
                     ids, size=len(C), replace=False, p=cur_trans_probs, shuffle=False
                 )
-            except:
+            except Exception as exc:
                 # Potential error due to zeroing of some probs
+                logger.warning(
+                    "Collision shielding probabilistic sampling fallback: "
+                    f"renormalizing transition probabilities with epsilon after {exc}."
+                )
                 cur_trans_probs = transition_probabilities[i][mask]
                 EPSILON = 1e-6
 

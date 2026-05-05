@@ -31,6 +31,8 @@ def add_training_args(parser):
     parser.add_argument("--lr_end", type=float, default=1e-6)
     parser.add_argument("--lr_scheduler", type=str, default="cosine-annealing")
     parser.add_argument("--num_epochs", type=int, default=300)
+    parser.add_argument("--max_train_batches", type=int, default=None)
+    parser.add_argument("--max_validation_batches", type=int, default=None)
 
     parser.add_argument("--grad_clip_value", type=float, default=None)
     parser.add_argument("--grad_clip_norm", type=str, default="2.0")
@@ -140,6 +142,39 @@ def add_training_args(parser):
         default="gru",
         choices=["gru"],
         help="Update rule for the optional coordination-state token.",
+    )
+    parser.add_argument(
+        "--sequence_training",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train over episode sequences instead of independent snapshots.",
+    )
+    parser.add_argument(
+        "--sequence_detach_state",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Detach coordination state between timesteps in sequence training. "
+            "Leave disabled for full BPTT inside a sequence batch."
+        ),
+    )
+    parser.add_argument(
+        "--truncated_bptt_length",
+        type=int,
+        default=None,
+        help=(
+            "Detach coordination state every N timesteps in sequence training. "
+            "Use None for full BPTT over the whole sequence batch."
+        ),
+    )
+    parser.add_argument(
+        "--validate_sequence_training_dataset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run sequence dataset assumption checks before sequence training. "
+            "Disable only after an explicit dataset audit has already passed."
+        ),
     )
 
     parser.add_argument(

@@ -1,5 +1,6 @@
 import pickle
 import pathlib
+from loguru import logger
 
 
 def load_dataset(funcs, dir_name, args):
@@ -11,6 +12,9 @@ def load_dataset(funcs, dir_name, args):
             with open(path, "rb") as f:
                 dataset = pickle.load(f)
             return dataset
-        except:
-            print(f"Could not find file: {path}, trying legacy file name.")
+        except Exception as exc:
+            logger.warning(
+                f"Could not load dataset file {path}: {exc}. "
+                "Trying legacy file name fallback."
+            )
     raise FileNotFoundError("Could not find any dataset file.")

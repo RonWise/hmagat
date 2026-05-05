@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from loguru import logger
 
 from hmagat.generate_additional_data import any_additional_data
 from hmagat.modules.model.model_selection import get_gnn_module
@@ -760,6 +761,7 @@ class DecentralPlannerGATNet(torch.nn.Module):
         self.coordination_state_update = coordination_state_update
         self.coordination_state_cell = None
         self._coordination_state = None
+        self.detach_coordination_state = True
         if self.coordination_state_size > 0:
             if self.coordination_state_update != "gru":
                 raise ValueError(
@@ -830,6 +832,9 @@ class DecentralPlannerGATNet(torch.nn.Module):
     def reset_coordination_state(self):
         self._coordination_state = None
 
+    def set_coordination_state_detach(self, value):
+        self.detach_coordination_state = value
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -887,7 +892,10 @@ class DecentralPlannerGATNet(torch.nn.Module):
             ):
                 prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
             state = self.coordination_state_cell(x, prev_state)
-            self._coordination_state = state.detach()
+            if self.detach_coordination_state:
+                self._coordination_state = state.detach()
+            else:
+                self._coordination_state = state
         else:
             prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
             state = self.coordination_state_cell(x, prev_state)
@@ -1003,6 +1011,7 @@ def load_partial_state_dict(model, state_dict, print_prefix=""):
     skipped_missing = []
     skipped_shape = []
     skipped_related = []
+    widened_linear = []
     shape_mismatch_modules = set()
 
     for key, value in state_dict.items():
@@ -1010,12 +1019,30 @@ def load_partial_state_dict(model, state_dict, print_prefix=""):
             skipped_missing.append(key)
             continue
         if model_state[key].shape != value.shape:
+            if (
+                value.ndim == 2
+                and model_state[key].ndim == 2
+                and value.shape[0] == model_state[key].shape[0]
+                and value.shape[1] < model_state[key].shape[1]
+            ):
+                widened_value = torch.zeros_like(model_state[key])
+                widened_value[:, : value.shape[1]] = value.to(
+                    device=widened_value.device,
+                    dtype=widened_value.dtype,
+                )
+                loadable_state[key] = widened_value
+                widened_linear.append(
+                    (key, tuple(value.shape), tuple(model_state[key].shape))
+                )
+                continue
             skipped_shape.append((key, tuple(value.shape), tuple(model_state[key].shape)))
             shape_mismatch_modules.add(key.rsplit(".", 1)[0])
             continue
 
     for key, value in state_dict.items():
         if key not in model_state:
+            continue
+        if key in loadable_state:
             continue
         if model_state[key].shape != value.shape:
             continue
@@ -1029,41 +1056,108 @@ def load_partial_state_dict(model, state_dict, print_prefix=""):
         loadable_state, strict=False
     )
 
-    print(f"{print_prefix}Partial checkpoint loading:")
-    print(f"{print_prefix}  loaded keys: {len(loadable_state)}")
-    print(f"{print_prefix}  skipped missing keys: {len(skipped_missing)}")
-    print(f"{print_prefix}  skipped shape-mismatch keys: {len(skipped_shape)}")
-    print(f"{print_prefix}  skipped related keys: {len(skipped_related)}")
-    print(f"{print_prefix}  model keys left missing: {len(missing_after_load)}")
-    print(f"{print_prefix}  unexpected keys after load: {len(unexpected_after_load)}")
+    logger.warning(f"{print_prefix}Partial checkpoint loading:")
+    logger.warning(f"{print_prefix}  loaded keys: {len(loadable_state)}")
+    logger.warning(f"{print_prefix}  skipped missing keys: {len(skipped_missing)}")
+    logger.warning(f"{print_prefix}  skipped shape-mismatch keys: {len(skipped_shape)}")
+    logger.warning(f"{print_prefix}  skipped related keys: {len(skipped_related)}")
+    logger.warning(f"{print_prefix}  widened linear keys: {len(widened_linear)}")
+    logger.warning(f"{print_prefix}  model keys left missing: {len(missing_after_load)}")
+    logger.warning(
+        f"{print_prefix}  unexpected keys after load: {len(unexpected_after_load)}"
+    )
 
     if skipped_missing:
-        print(f"{print_prefix}  skipped missing key names:")
+        logger.warning(f"{print_prefix}  skipped missing key names:")
         for key in skipped_missing:
-            print(f"{print_prefix}    {key}")
+            logger.warning(f"{print_prefix}    {key}")
 
     if skipped_shape:
-        print(f"{print_prefix}  skipped shape-mismatch key names:")
+        logger.warning(f"{print_prefix}  skipped shape-mismatch key names:")
         for key, checkpoint_shape, model_shape in skipped_shape:
-            print(
+            logger.warning(
                 f"{print_prefix}    {key}: checkpoint {checkpoint_shape} -> model {model_shape}"
             )
 
+    if widened_linear:
+        logger.warning(f"{print_prefix}  widened linear key names:")
+        for key, checkpoint_shape, model_shape in widened_linear:
+            logger.warning(
+                f"{print_prefix}    {key}: copied checkpoint prefix "
+                f"{checkpoint_shape} into model {model_shape}; zero-initialized "
+                "new input columns."
+            )
+
     if skipped_related:
-        print(f"{print_prefix}  skipped keys from shape-mismatched modules:")
+        logger.warning(f"{print_prefix}  skipped keys from shape-mismatched modules:")
         for key in skipped_related:
-            print(f"{print_prefix}    {key}")
+            logger.warning(f"{print_prefix}    {key}")
 
     if missing_after_load:
-        print(f"{print_prefix}  model keys initialized from current model:")
+        logger.warning(f"{print_prefix}  model keys initialized from current model:")
         for key in missing_after_load:
-            print(f"{print_prefix}    {key}")
+            logger.warning(f"{print_prefix}    {key}")
 
     return {
         "loaded": list(loadable_state.keys()),
         "skipped_missing": skipped_missing,
         "skipped_shape": skipped_shape,
         "skipped_related": skipped_related,
+        "widened_linear": [key for key, _checkpoint_shape, _model_shape in widened_linear],
         "missing_after_load": missing_after_load,
         "unexpected_after_load": unexpected_after_load,
     }
+
+
+def _keys_outside_allowed_prefixes(keys, allowed_prefixes):
+    return [
+        key
+        for key in keys
+        if not any(key.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+
+
+def validate_partial_load_compatibility(
+    summary,
+    print_prefix="",
+    *,
+    allowed_skipped_missing_prefixes=(),
+    allowed_skipped_shape_prefixes=("actionsMLP.0.",),
+    allowed_skipped_related_prefixes=("actionsMLP.0.",),
+    allowed_missing_after_load_prefixes=(
+        "coordination_state_cell.",
+        "actionsMLP.0.",
+    ),
+):
+    skipped_shape_keys = [
+        key for key, _checkpoint_shape, _model_shape in summary["skipped_shape"]
+    ]
+    unexpected = {
+        "skipped_missing": _keys_outside_allowed_prefixes(
+            summary["skipped_missing"], allowed_skipped_missing_prefixes
+        ),
+        "skipped_shape": _keys_outside_allowed_prefixes(
+            skipped_shape_keys, allowed_skipped_shape_prefixes
+        ),
+        "skipped_related": _keys_outside_allowed_prefixes(
+            summary["skipped_related"], allowed_skipped_related_prefixes
+        ),
+        "missing_after_load": _keys_outside_allowed_prefixes(
+            summary["missing_after_load"], allowed_missing_after_load_prefixes
+        ),
+        "unexpected_after_load": list(summary["unexpected_after_load"]),
+    }
+    unexpected = {name: keys for name, keys in unexpected.items() if keys}
+    if not unexpected:
+        return
+
+    logger.warning(f"{print_prefix}Partial checkpoint compatibility check failed.")
+    for group_name, keys in unexpected.items():
+        logger.warning(f"{print_prefix}  unexpected {group_name}: {len(keys)}")
+        for key in keys:
+            logger.warning(f"{print_prefix}    {key}")
+    raise ValueError(
+        "Partial checkpoint is incompatible with the current model configuration; "
+        "check model flags such as --cnn_mode, --imitation_learning_model, "
+        "--use_edge_attr_for_messages, and HMAGAT-CS options."
+    )
