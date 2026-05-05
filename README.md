@@ -1,246 +1,231 @@
-# Pairwise is Not Enough: Hypergraph Neural Networks for Multi-Agent Pathfinding
-[![arXiv](https://img.shields.io/badge/arXiv-2602.06733-b31b1b.svg)](https://arxiv.org/abs/2602.06733)
-[![PyTorch](https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white)](#)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
+# HMAGAT-CS README
 
-This is the code repository for the paper ["Pairwise is Not Enough: Hypergraph Neural Networks for Multi-Agent Pathfinding"](https://arxiv.org/abs/2602.06733) introducing HMAGAT, Hypergraph Multi-Agent Attention Network, a hypergraph neural network for multi-agent pathfinding (MAPF). The paper has been accepted at ICLR 2026.
+## Что это
 
-![](./assets/arch.png)
+`HMAGAT-CS` -- расширение `HMAGAT` / `DirectionalHMAGAT`, которое добавляет
+per-agent recurrent coordination state после graph/hypergraph блока и перед
+action decoder.
 
-## Structure Overview
-Parts of the algorithm implementations are taken from the [POGEMA Benchmark](https://github.com/Cognitive-AI-Systems/pogema-benchmark)
-and are detailed in `pogema_benchmark/README.md`. We also take the PIBT algorithm implementation from
-[PyPIBT](https://github.com/Kei18/pypibt), as detailed
-in `pibt/pypibt/README.md`. SSIL implementation has been taken from the [ML-MAPF-with-Search](https://github.com/Rishi-V/ML-MAPF-with-Search)
-repository. The code for MAPF-GPT has been taken from
-[MAPF-GPT](https://github.com/CognitiveAISystems/MAPF-GPT).
-
-```plaintext
-├── checkpoints
-|      Checkpoints for HMAGAT and MAGAT models.
-├── dcc
-|      Code for DCC solver (from pogema-benchmark).
-├── docker
-|      Contains relevant dockerfile for running the code.
-├── gpt
-|      Code for MAPF-GPT, also includes PIBT collision shielding.
-├── hmagat
-|      Our code for HMAGAT (and MAGAT) training.
-├── lacam
-|      Code for LaCAM3 (from pogema-benchmark).
-├── magat
-|      Contains license for the MAGAT code, which we build upon.
-├── pibt
-|      Code for PIBT (from PyPIBT).
-├── pogema_benchmark
-├── pyamg
-|      PyAMG code, which includes code for Lloyd's algorithm on graphs.
-├── scrimp
-|      Code for SCRIMP (from pogema-benchmark).
-├── ssil
-|      Code for SSIL (from ML-MAPF-with-Search).
-|
-├── grid_config_generator.py
-|      Generates grid configs for testing and training.
-├── README.md
-├── test_expert.py
-|      Testing code for other experts (i.e. models other than HMAGAT and MAGAT).
-└── test_imitation_learning_pyg.py
-       Testing code for HMAGAT (and MAGAT).
-```
-
-## Usage
-The easiest way to train and test the models is to use the provided `docker/dockerfile`.
-The docker file is based on the one provided by pogema-benchmark. We also provide
-`docker/dockerfile_ssil` to run the SSIL evaluation.
-
-### Local Docker workflow
-For local experimentation, this repository also includes:
-
-- `docker/docker-compose.yml` for running the project in a mounted container
-- `Makefile` with helper targets for build, testing, and animation export
-
-Typical workflow:
-
-```sh
-make build
-make gpu-check
-make demo-small
-make demo-svg
-```
-
-This produces an animated SVG at:
+Базовый pipeline:
 
 ```text
-outputs/svg/anim_0.svg
+obs -> CNN -> MAGAT/HMAGAT -> MLP -> action logits
 ```
 
-### Converting SVG animation to GIF
-`pogema` saves animations as animated SVG files. To convert them to GIF inside the
-container, first start a persistent container, then install the GIF tools once, and
-finally run the conversion:
-
-```sh
-docker compose -f docker/docker-compose.yml run -d --name hmagat-work hmagat sleep infinity
-make gif-tools
-make gif
-```
-
-This creates:
+`HMAGAT-CS` pipeline:
 
 ```text
-outputs/anim_0.gif
+obs -> CNN -> MAGAT/HMAGAT -> h_i^t
+m_i^t = GRUCell(h_i^t, m_i^{t-1})
+logits_i^t = MLP([h_i^t ; m_i^t])
 ```
 
-## HMAGAT
-HMAGAT is a hypergraph attention network for MAPF. We base it on MAGAT
-by [Li et. al.](https://arxiv.org/abs/2011.13219). We include the dataset generation
-and training code for HMAGAT in `hmagat/` directory.
-The CNN encoding definition and parts of
-the model definition in `hmagat/modules/agents.py` are taken from the implementation of
-[MAGAT](https://github.com/proroklab/magat_pathplanning). We include the LICENSE
-from the forementioned repository at `magat/LICENSE`.
-Below we provide an overview of the directory:
+Для каждого агента хранится свой hidden state:
 
-```plaintext
-├── hmagat
-|   ├── additional_data
-|   |      Cost-to-go matrix generation.
-|   |
-|   ├── hypergraph_gen_strategies
-|   |      Implementations of the hypergraph generators.
-|   |
-|   ├── modules
-|   |   ├── model
-|   |   |      HGNN and GNN definitions.
-|   |   ├── temperature_sampling
-|   |   |      Temperature sampling module definition -- Actor-Critic model and PPO-based loss.
-|   |   └── agents.py
-|   |          Model definition.
-|   |
-|   ├── collision_shielding.py
-|   |      Code to allow naive or PIBT collision shielding for the model.
-|   ├── convert_to_imitation_dataset.py
-|   |      Converts raw expert prediction to graph based format.
-|   ├── dataset_loading.py
-|   ├── generate_additional_data.py
-|   |      Generates any additional input dataset, like cost-to-go matrix, greedy actions, history.
-|   ├── generate_expert_makespans.py
-|   |      Code to calculate the makespans of expert solutions (for Quality Imp. Training).
-|   ├── generate_hypergraphs.py
-|   |      Code to generate hypergraphs for collected trajectories.
-|   ├── generate_pos.py
-|   |      Code to generate the agent position dataset (for edge features).
-|   ├── generate_target_vec.py
-|   ├── imitation_dataset_pyg.py
-|   |      Dataset definition for the torch geometric hypergraphs and graphs.
-|   ├── loss.py
-|   ├── lr_scheduler.py
-|   ├── post_train_quality_imp.py
-|   |      Code for the post-training finetuning for solution quality improvement,
-|   |      based on on-demand dataset aggregation.
-|   ├── run_expert.py
-|   |      Code to generate the raw expert predictions.
-|   ├── runtime_data_generation.py
-|   |      Unifying code to take environment observations and produce hypergraph (or graph) data.
-|   ├── temperature_training.py
-|   |      Trains HMAGAT's temperature sampling module.
-|   ├── train_imitation_learning_pyg.py
-|   |      Main HMAGAT training loop.
-|   ├── training_args.py
-|   └── utils.py
-└── test_imitation_learning_pyg.py
-       Code to test the trained model.
+```text
+state: [num_agents, coordination_state_size]
 ```
 
-### Dataset Generation
-The dataset generation first involves collection of expert trajectories and then extracting/generating
-relevant features from them. We note below the commands to generate the dataset used by the HMAGAT
-model in the paper. Please update `/path/to/dataset` with the appropriate path.
+Это не global token на всю сцену. Одна общая `GRUCell` применяется ко всем
+агентам с shared weights, поэтому параметры модели не привязаны к числу
+агентов. Важно сохранять стабильное соответствие строки tensor-а конкретному
+агенту между соседними timestep-ами rollout.
+
+## Как включить
+
+Основные CLI-флаги:
+
+```text
+--coordination_state_size 32
+--coordination_state_update gru
+```
+
+`--coordination_state_size 0` отключает CS и оставляет старую архитектуру.
+`gru` пока единственный поддержанный update rule.
+
+Sequence-aware training включается отдельно:
+
+```text
+--sequence_training
+--truncated_bptt_length 8
+```
+
+Дополнительные флаги sequence path:
+
+```text
+--sequence_detach_state
+--no-validate_sequence_training_dataset
+```
+
+По умолчанию sequence dataset валидируется. Отключать проверку стоит только для
+уже проверенного большого датасета.
+
+## Текущий статус
+
+Реализовано:
+
+- `HMAGAT-CS` forward path для graph и hypergraph моделей;
+- per-agent recurrent state в rollout;
+- sequence-aware training path с BPTT / truncated BPTT;
+- sequence-aware validation accuracy;
+- sharded dataset pipeline от expert episodes до training loader;
+- sidecar index для sharded training dataset;
+- audit sequence dataset;
+- partial checkpoint loading из старого `HMAGAT` checkpoint в widened
+  `HMAGAT-CS` модель.
+
+Не является частью текущей реализации:
+
+- explicit timestep field в dataset;
+- persistent environment agent id: текущий `agent_id` -- row-position marker;
+- freeze/warmup режим `--cs_warmup_freeze_baseline`. Он описан в implementation
+  runbook как следующий TDD task, но в коде пока не реализован.
+
+## Загрузка из старого HMAGAT checkpoint
+
+Старый `HMAGAT` checkpoint нельзя strict-загрузить в `HMAGAT-CS`, потому что
+появляется новый `coordination_state_cell.*`, а первый decoder layer получает
+больший input:
+
+```text
+h_dim + coordination_state_size
+```
+
+Для warm-start используется:
+
+```text
+--load_partial_parameters_path checkpoints/hmagat/best.pt
+```
+
+Текущий partial loader делает не обычный skip widened decoder-а, а специальную
+загрузку widened linear layer:
+
+- совместимые CNN/HGNN/decoder параметры загружаются;
+- `actionsMLP.0.weight[:, :old_in]` копируется из checkpoint;
+- новые CS-колонки `actionsMLP.0.weight[:, old_in:]` инициализируются нулями;
+- `actionsMLP.0.bias` загружается, если shape совпадает;
+- `coordination_state_cell.*` остается свежим;
+- все loaded/skipped/widened/missing keys логируются через `loguru.warning`.
+
+Ожидаемый warning summary для корректного warm-start:
+
+```text
+[partial-load]  skipped shape-mismatch keys: 0
+[partial-load]  skipped related keys: 0
+[partial-load]  widened linear keys: 1
+[partial-load]    actionsMLP.0.weight: copied checkpoint prefix (128, 128)
+                  into model (128, 160); zero-initialized new input columns.
+```
+
+После такого zero-shot load `HMAGAT-CS` должен сохранять baseline behavior до
+обучения CS-памяти. Это проверяется unit-тестами на совпадение baseline logits
+и zero-shot CS logits при нулевом вкладе новых decoder columns.
+
+## Датасет и обучение через шарды
+
+Полный sharded pipeline описан в
+`docs/hmagat-cs_implementation.md`, секция "Практический pipeline: dataset,
+audit, training, inference".
+
+Этапы:
+
+1. `python -m hmagat.generate_expert_sharded` -- генерация expert episodes по
+   worker shards.
+2. `python -m hmagat.convert_to_imitation_dataset --use_shards` -- конвертация
+   raw expert shards в processed shards.
+3. `python -m hmagat.generate_hypergraphs --use_shards` -- добавление
+   hypergraph-разметки.
+4. `python -m hmagat.generate_additional_data --use_shards` -- добавление
+   cost-to-go и related features.
+5. `python -m hmagat.generate_pos --use_shards` -- генерация positional /
+   edge-attribute данных.
+6. `python -m hmagat.audit_sequence_dataset --use_shards` -- аудит assumptions
+   для sequence training.
+7. `python -m hmagat.train_imitation_learning_pyg --use_shards` -- обучение
+   напрямую из processed shards.
+
+Sharded training loader использует sidecar index:
+
+```text
+processed_dataset/shards/training_index.json
+```
+
+Если sidecar отсутствует, он перестраивается из processed shards с явным
+`loguru.warning`. Это осознанный logged fallback, а не тихое поведение.
+
+## Demo / inference
+
+Inference/demo запускается через `test_imitation_learning_pyg.py`. Baseline
+использует pretrained checkpoint из `checkpoints/hmagat`. CS zero-shot или CS
+checkpoint должны запускаться с теми же demo-параметрами, что и baseline:
+
+```text
+--cnn_mode ResNetLarge_withMLP
+--model_residuals all
+--collision_shielding pibt
+--action_sampling probabilistic
+--use_edge_attr
+--use_edge_attr_for_messages positions+manhattan
+--edge_attr_cnn_mode MLP
+--load_positions_separately
+```
+
+Для CS-архитектуры при inference обязательно задавать тот же
+`--coordination_state_size`, с которым был создан checkpoint. Это параметр
+архитектуры, а не только обучения.
+
+Zero-shot parity check запускает CS-модель из baseline checkpoint через
+`--load_partial_parameters_path checkpoints/hmagat/best.pt` без обучения. Если
+zero-shot CS хуже baseline, это указывает на проблему в архитектуре,
+state-handling или partial load. После widened-load фикса zero-shot CS не
+ломает baseline behavior на warehouse demo protocol.
+
+## Минимальные проверки
+
+Unit tests:
 
 ```sh
-python -m hmagat.run_expert --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable
+docker exec hmagat-work bash -lc 'cd /workspace && python -m unittest tests.test_hmagat_cs tests.test_sharded_expert_generation tests.test_sharded_training_dataset'
 ```
 
-This can then we converted to an imitation learning dataset.
+Покрываются:
+
+- `MAGAT + coordination_state`;
+- `DirectionalHMAGAT + coordination_state`;
+- state lifecycle в `simulation=True`;
+- snapshot mode без переноса hidden state;
+- sequence dataset grouping/collation/loss;
+- sharded expert generation helpers;
+- sharded training dataset indexing/splitting;
+- widened partial load и zero-shot parity.
+
+## Docker workflow
+
+Для этого проекта используется существующий persistent контейнер:
 
 ```sh
-python -m hmagat.convert_to_imitation_dataset --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --use_lists
+docker exec hmagat-work bash -lc 'cd /workspace && ...'
 ```
 
-We can then generate hypergraphs for the collected dataset.
+Не использовать `docker run --rm` для рабочих команд этого pipeline.
 
-```sh
-python -m hmagat.generate_hypergraphs --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --hypergraph_comm_radius 7 --hyperedge_generation_method kmeans --hypergraph_num_updates 10 --hypergraph_wait_one --hypergraph_initial_colperc 0.1 --hypergraph_final_colperc 0.1 
+## Артефакты
+
+Датасеты, checkpoints, renders и outputs не являются частью compact prerelease
+переноса. Они должны оставаться локальными артефактами:
+
+```text
+datasets/
+checkpoints/
+outputs/
+renders/
 ```
 
-Normalized cost-to-go features can be generated for the dataset as below.
+## Где смотреть детали
 
-```sh
-python -m hmagat.generate_additional_data --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --add_data_cost_to_go --normalize_cost_to_go --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --clamp_cost_to_go 1.0
-```
+Основной документ с детальными командами, аудитом параметров, training
+стратегиями и inference-сравнением:
 
-For the relative position-based edge features, we also generate the positional data.
-
-```sh
-python -m hmagat.generate_pos --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --use_edge_attr --use_lists
-```
-
-### Training
-The HMAGAT model can be trained on the previously generated dataset, by appropriately replacing the `/path/to/dataset`
-and `/path/to/checkpoints` values below.
-
-```sh
-python -m hmagat.train_imitation_learning_pyg --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --hypergraph_comm_radius 7 --hyperedge_generation_method kmeans --hypergraph_num_updates 10 --hypergraph_wait_one --hypergraph_initial_colperc 0.1 --hypergraph_final_colperc 0.1 --add_data_cost_to_go --normalize_cost_to_go --clamp_cost_to_go 1.0 --use_lists --checkpoints_dir /path/to/checkpoints/hmagat_pre_finetune --run_name hmagat_pre_finetune --device -1 --run_online_expert --imitation_learning_model DirectionalHMAGAT --hyperedge_feature_generator magat --final_feature_generator magat --model_residuals all --use_edge_attr --use_edge_attr_for_messages positions+manhattan --edge_attr_cnn_mode MLP --load_positions_separately --train_on_terminated_agents --recursive_oe --cnn_mode ResNetLarge_withMLP --no-run_expert_in_separate_fork --oe_improve_quality --oe_improve_quality_expert LaCAM-withMaxSteps-1-2-10 --collision_shielding naive --action_sampling probabilistic
-```
-
-We can then perform post-training quality improvement finetuning as below:
-
-```sh
-python -m hmagat.post_train_quality_imp --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 30000 --save_termination_state --expert_algorithm LaCAM --obstacle_density_max 0.7 --ensure_grid_config_is_generatable --hypergraph_comm_radius 7 --hyperedge_generation_method kmeans --hypergraph_num_updates 10 --hypergraph_wait_one --hypergraph_initial_colperc 0.1 --hypergraph_final_colperc 0.1 --add_data_cost_to_go --normalize_cost_to_go --clamp_cost_to_go 1.0 --use_lists --checkpoints_dir /path/to/checkpoints/hmagat --run_name hmagat --device -1 --run_online_expert --imitation_learning_model DirectionalHMAGAT --hyperedge_feature_generator magat --final_feature_generator magat --model_residuals all --use_edge_attr --use_edge_attr_for_messages positions+manhattan --edge_attr_cnn_mode MLP --load_positions_separately --train_on_terminated_agents --recursive_oe --cnn_mode ResNetLarge_withMLP --collision_shielding naive --action_sampling probabilistic --no-run_expert_in_separate_fork --oe_improve_quality --oe_improve_quality_expert LaCAM-withMaxSteps-1-2-10 --pretrain_weights_path /path/to/checkpoints/hmagat_pre_finetune/best.pt --lr_start 1e-4 --oe_improve_quality_threshold 0.94
-```
-
-Finally, we train the RL-based temperature sampling module.
-
-```sh
-python -m hmagat.temperature_training.py --dataset_dir /path/to/dataset --obs_radius 5 --num_samples 100 --save_termination_state --expert_algorithm LaCAM --obstacle_density_min 0.4 --obstacle_density_max 0.7 --num_agents 32+64 --ensure_grid_config_is_generatable --max_episode_steps 256 --hypergraph_comm_radius 7 --hyperedge_generation_method kmeans --hypergraph_num_updates 10 --hypergraph_wait_one --hypergraph_initial_colperc 0.1 --hypergraph_final_colperc 0.1 --add_data_cost_to_go --normalize_cost_to_go --clamp_cost_to_go 1.0 --use_lists --checkpoints_dir /path/to/checkpoints/hmagat --run_name hmagat --device -1 --run_online_expert --imitation_learning_model DirectionalHMAGAT --hyperedge_feature_generator magat --final_feature_generator magat --model_residuals all --use_edge_attr --use_edge_attr_for_messages positions+manhattan --edge_attr_cnn_mode MLP --load_positions_separately --train_on_terminated_agents --recursive_oe --cnn_mode ResNetLarge_withMLP --no-run_expert_in_separate_fork --oe_improve_quality --oe_improve_quality_expert LaCAM-withMaxSteps-1-2-10 --collision_shielding pibt --action_sampling probabilistic --rl_based_temperature_sampling --temperature_checkpoints_dir /path/to/checkpoints/hmagat_temperature_module --temperature_run_name simple_rl --temperature_actor_critic simple-local-val-init --temperature_optimize only-all-on-goal --iterations_per_epoch 3 --temperature_min_val 0.5 --temperature_max_val 1.0 --num_epochs 100
-```
-
-## Evaluation
-The trained HMAGAT model can be evaluation using `test_imitation_learning_pyg.py`.
-Below we provide a sample command to run tests over a dense warehouse map with 128 agents, using the provided
-checkpoints.
-
-```sh
-python test_imitation_learning_pyg.py --obs_radius 5 --save_termination_state --hypergraph_comm_radius 7 --hyperedge_generation_method kmeans --hypergraph_num_updates 10 --hypergraph_wait_one --hypergraph_initial_colperc 0.1 --hypergraph_final_colperc 0.1 --add_data_cost_to_go --normalize_cost_to_go --clamp_cost_to_go 1.0 --use_lists --checkpoints_dir checkpoints/hmagat --run_name hmagat --device -1 --run_online_expert --imitation_learning_model DirectionalHMAGAT --hyperedge_feature_generator magat --final_feature_generator magat --model_residuals all --use_edge_attr --use_edge_attr_for_messages positions+manhattan --edge_attr_cnn_mode MLP --load_positions_separately --train_on_terminated_agents --recursive_oe --cnn_mode ResNetLarge_withMLP --rl_based_temperature_sampling --temperature_checkpoints_dir checkpoints/hmagat_temperature_module --temperature_run_name simple_rl --temperature_actor_critic simple-local-val-init --temperature_optimize only-all-on-goal --iterations_per_epoch 3 --temperature_min_val 0.5 --temperature_max_val 0.9 --temperature_sampling_model_epoch_num 43 --collision_shielding pibt --action_sampling probabilistic --test_name dense_warehouse_128 --test_num_samples 128 --test_obs_radius 5 --test_map_types warehouse=1.0 --test_num_agents 128+128 --test_wall_width_min 8 --test_wall_width_max 8 --test_vertical_gap 1 --test_num_wall_rows_min 5 --test_num_wall_rows_max 5 --test_num_wall_cols_min 2 --test_num_wall_cols_max 2 --test_side_pad 3 --test_max_episode_steps 512 --test_min_dist 10
-```
-
-MAPF-GPT (85M) can be run on the same dense warehouse instances using the below command.
-
-```sh
-python test_expert.py --expert_algorithm MAPF-GPT-PIBT-85M --set_expert_time_limit 60 --test_name dense_warehouse_128 --num_samples 128 --obs_radius 5 --map_types warehouse=1.0 --num_agents 128+128 --wall_width_min 8 --wall_width_max 8 --vertical_gap 1 --num_wall_rows_min 5 --num_wall_rows_max 5 --num_wall_cols_min 2 --num_wall_cols_max 2 --side_pad 3 --max_episode_steps 512 --min_dist 10
-```
-
-## Algorithms
-Below we note each pre-existing algorithm included, with the links to the original repositories.
-
-| Algorithm  | Link |
-|-----------|------|
-| DCC       | [https://github.com/ZiyuanMa/DCC](https://github.com/ZiyuanMa/DCC) |
-| LaCAM3    | [https://github.com/Kei18/lacam3](https://github.com/Kei18/lacam3) |
-| MAGAT     | [https://github.com/proroklab/magat_pathplanning](https://github.com/proroklab/magat_pathplanning) |
-| MAPF-GPT  | [https://github.com/CognitiveAISystems/MAPF-GPT](https://github.com/CognitiveAISystems/MAPF-GPT) |
-| PIBT      | [https://github.com/Kei18/pypibt](https://github.com/Kei18/pypibt) |
-| SCRIMP    | [https://github.com/marmotlab/SCRIMP](https://github.com/marmotlab/SCRIMP) |
-| SSIL      | [https://github.com/Rishi-V/ML-MAPF-with-Search](https://github.com/Rishi-V/ML-MAPF-with-Search) |
-
-## Citation
-
-```bibtex
-@article{jain2026hmagat,
-  title={Pairwise is Not Enough: Hypergraph Neural Networks for Multi-Agent Pathfinding},
-  author={Jain, Rishabh and Okumura, Keisuke and Amir, Michael and Liò, Pietro and Prorok, Amanda},
-  year={2026},
-  journal={arXiv preprint arxiv:2602.06733}
-}
+```text
+docs/hmagat-cs_implementation.md
 ```
