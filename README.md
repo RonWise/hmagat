@@ -8,17 +8,24 @@ action decoder.
 
 Базовый pipeline:
 
-```text
-obs -> CNN -> MAGAT/HMAGAT -> MLP -> action logits
-```
+$$
+o_i^t \rightarrow \mathrm{CNN} \rightarrow \mathrm{MAGAT/HMAGAT}
+\rightarrow \mathrm{MLP} \rightarrow \mathrm{logits}_i^t
+$$
 
 `HMAGAT-CS` pipeline:
 
-```text
-obs -> CNN -> MAGAT/HMAGAT -> h_i^t
-m_i^t = GRUCell(h_i^t, m_i^{t-1})
-logits_i^t = MLP([h_i^t ; m_i^t])
-```
+$$
+h_i^t = \mathrm{MAGAT/HMAGAT}(\mathrm{CNN}(o_i^t), S_t)
+$$
+
+$$
+m_i^t = \mathrm{GRUCell}(h_i^t, m_i^{t-1})
+$$
+
+$$
+\mathrm{logits}_i^t = \mathrm{MLP}([h_i^t ; m_i^t])
+$$
 
 Для каждого агента хранится свой hidden state:
 
