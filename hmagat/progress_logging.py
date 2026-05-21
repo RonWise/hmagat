@@ -37,6 +37,16 @@ class ProgressLogger:
         )
         logger.info(f"{self.label} started: total={self.total}{requested}")
 
+    def elapsed_text(self):
+        return _format_duration(time.monotonic() - self.start_time)
+
+    def eta_text(self, current):
+        current = int(current)
+        elapsed = time.monotonic() - self.start_time
+        average = elapsed / max(1, current)
+        remaining = max(0, self.total - current)
+        return _format_duration(remaining * average)
+
     def update(self, current, *, extra=None, force=False):
         current = int(current)
         now = time.monotonic()

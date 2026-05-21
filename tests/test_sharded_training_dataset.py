@@ -15,8 +15,11 @@ from hmagat.imitation_dataset_pyg import (
     MAPFSequenceDataset,
     validate_sequence_dataset_assumptions,
 )
+from hmagat.sharded_training_dataset import ShardedEpisodeBatchSampler
 from hmagat.sharded_training_dataset import ShardedSnapshotDataset
 from hmagat.sharded_training_dataset import ShardedEpisodeSampler
+from hmagat.sharded_training_dataset import ShardedSequenceEpisode
+from hmagat.sharded_training_dataset import ShardedSequenceDataset
 from hmagat.sharded_training_dataset import build_sharded_snapshot_datasets
 
 
@@ -26,6 +29,7 @@ def _args(tmp_dir, name="paper", num_samples=4):
         override_name=name,
         num_samples=num_samples,
         dataset_seed=42,
+        sharded_dataset_cache_size=1,
         obs_radius=1,
         save_termination_state=True,
         expert_algorithm="LaCAM",
@@ -305,6 +309,14 @@ class ShardedTrainingDatasetTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(actual.edge_attr, expected.edge_attr)
 
+            stats = sharded.runtime_stats_snapshot()
+            self.assertEqual(stats["shard_loads"], 2)
+            self.assertGreaterEqual(stats["processed_payload_load_sec"], 0.0)
+            self.assertGreaterEqual(stats["positions_payload_load_sec"], 0.0)
+            self.assertGreaterEqual(stats["additional_data_payload_load_sec"], 0.0)
+            self.assertGreaterEqual(stats["hypergraph_payload_load_sec"], 0.0)
+            self.assertGreaterEqual(stats["shard_dataset_materialization_sec"], 0.0)
+
     def test_sharded_sequence_dataset_preserves_episode_order(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             args = _args(tmp_dir)
@@ -328,6 +340,124 @@ class ShardedTrainingDatasetTest(unittest.TestCase):
             self.assertTrue(sequences[0][0].first_step.item())
             self.assertFalse(sequences[0][1].first_step.item())
 
+    def test_native_sharded_sequence_dataset_matches_snapshot_wrapped_sequences(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            sharded_snapshot = ShardedSnapshotDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+            wrapped_sequence = MAPFSequenceDataset(sharded_snapshot)
+            native_sequence = ShardedSequenceDataset.from_snapshot_dataset(
+                sharded_snapshot
+            )
+
+            self.assertEqual(len(native_sequence), len(wrapped_sequence))
+            self.assertEqual(native_sequence.episode_shard_indices, [0, 0, 1, 1])
+            for episode_idx in range(len(native_sequence)):
+                self.assertIsInstance(
+                    native_sequence[episode_idx], ShardedSequenceEpisode
+                )
+                self.assertEqual(
+                    len(native_sequence[episode_idx]),
+                    len(wrapped_sequence[episode_idx]),
+                )
+                for actual, expected in zip(
+                    native_sequence[episode_idx], wrapped_sequence[episode_idx]
+                ):
+                    torch.testing.assert_close(actual.x, expected.x)
+                    torch.testing.assert_close(actual.y, expected.y)
+                    torch.testing.assert_close(
+                        actual.terminated, expected.terminated
+                    )
+                    self.assertEqual(
+                        bool(actual.first_step.item()),
+                        bool(expected.first_step.item()),
+                    )
+
+    def test_native_sharded_sequence_episode_defers_shard_access_until_iteration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            native_sequence = ShardedSequenceDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+
+            episode = native_sequence[0]
+            stats_before_access = native_sequence.runtime_stats_snapshot()
+
+            self.assertEqual(stats_before_access["shard_accesses"], 0)
+            self.assertEqual(stats_before_access["shard_loads"], 0)
+
+            first_timestep = episode[0]
+            stats_after_access = native_sequence.runtime_stats_snapshot()
+
+            self.assertTrue(first_timestep.first_step.item())
+            self.assertEqual(stats_after_access["shard_accesses"], 1)
+            self.assertEqual(stats_after_access["shard_loads"], 1)
+
+    def test_native_sharded_sequence_runtime_trace_records_caller_and_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            native_sequence = ShardedSequenceDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+            native_sequence.set_runtime_context(
+                dataset_role="train_sequence",
+                phase="train",
+                epoch=2,
+                batch_idx=7,
+            )
+
+            timestep_items = [[], []]
+            timestep_active_indices = [[], []]
+            native_sequence[0]._append_timestep_items(
+                timestep_items, timestep_active_indices, 0
+            )
+            stats = native_sequence.runtime_stats_snapshot()
+
+            self.assertEqual(stats["dataset_role"], "train_sequence")
+            self.assertEqual(stats["phase"], "train")
+            self.assertEqual(stats["epoch"], 2)
+            self.assertEqual(stats["batch_idx"], 7)
+            self.assertGreaterEqual(stats["load_events_recorded"], 1)
+            recent_events = stats["recent_shard_events"]
+            self.assertTrue(recent_events)
+            self.assertIn("cache_miss_load", recent_events[0])
+            self.assertIn("caller=sequence_episode_append_timestep_items", recent_events[0])
+            self.assertIn("dataset_role=train_sequence", recent_events[0])
+            self.assertIn("phase=train", recent_events[0])
+            self.assertIn("epoch=2", recent_events[0])
+            self.assertIn("batch_idx=7", recent_events[0])
+
     def test_sharded_episode_sampler_groups_sequences_by_shard(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             args = _args(tmp_dir)
@@ -348,6 +478,99 @@ class ShardedTrainingDatasetTest(unittest.TestCase):
 
             self.assertEqual(sharded.episode_shard_indices, [0, 0, 1, 1])
             self.assertEqual(list(sampler), [0, 1, 2, 3])
+
+    def test_sharded_episode_batch_sampler_keeps_batches_within_shard(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            sharded_snapshot = ShardedSnapshotDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+            native_sequence = ShardedSequenceDataset.from_snapshot_dataset(
+                sharded_snapshot
+            )
+            batch_sampler = ShardedEpisodeBatchSampler(
+                native_sequence,
+                batch_size=2,
+                shuffle=False,
+            )
+
+            self.assertEqual(list(batch_sampler), [[0, 1], [2, 3]])
+
+    def test_sharded_snapshot_dataset_lru_cache_reuses_loaded_shards(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            args.sharded_dataset_cache_size = 2
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            sharded = ShardedSnapshotDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+
+            _ = sharded[0]
+            _ = sharded[3]
+            _ = sharded[0]
+            stats = sharded.runtime_stats_snapshot()
+
+            self.assertEqual(stats["shard_loads"], 2)
+            self.assertEqual(stats["cache_hits"], 1)
+            self.assertEqual(stats["cache_evictions"], 0)
+            self.assertEqual(stats["cache_size"], 2)
+
+    def test_sharded_snapshot_dataset_lru_cache_evicts_when_capacity_is_one(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            args.sharded_dataset_cache_size = 1
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            sharded = ShardedSnapshotDataset(
+                args,
+                episode_start=0,
+                episode_end=4,
+                use_hypergraphs=False,
+                use_edge_attr=False,
+                additional_data_idx=[None, None, None],
+            )
+
+            _ = sharded[0]
+            _ = sharded[3]
+            _ = sharded[0]
+            stats = sharded.runtime_stats_snapshot()
+
+            self.assertEqual(stats["shard_loads"], 3)
+            self.assertEqual(stats["cache_hits"], 0)
+            self.assertEqual(stats["cache_evictions"], 2)
+            self.assertEqual(stats["cache_size"], 1)
+            recent_events = stats["recent_shard_events"]
+            self.assertTrue(
+                any("cache_evict" in event and "shard=0" in event for event in recent_events)
+            )
+            self.assertTrue(
+                any(
+                    "cache_miss_load" in event and "caller=snapshot_getitem" in event
+                    for event in recent_events
+                )
+            )
 
     def test_sharded_training_index_sidecar_is_written_and_reused(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -387,6 +610,45 @@ class ShardedTrainingDatasetTest(unittest.TestCase):
 
             self.assertEqual(len(sharded), 6)
             self.assertEqual(sharded.graph_map_id, [0, 0, 1, 2, 3, 3])
+
+    def test_sharded_training_index_infers_original_sample_ids_from_graph_map_range_without_raw_shards(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = _args(tmp_dir)
+            shard_0 = _dense_shard(0, [2, 1])
+            shard_1 = _dense_shard(2, [1, 2])
+            _write_stage_payloads(
+                tmp_dir, args, "processed_dataset", "processed", [shard_0, shard_1]
+            )
+            manifest_path = os.path.join(
+                tmp_dir, "processed_dataset", "shards", "manifest.json"
+            )
+            with open(manifest_path) as f:
+                import json
+
+                manifest = json.load(f)
+            for entry in manifest["entries"]:
+                entry.pop("original_sample_ids", None)
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+
+            warnings = _capture_warnings(
+                lambda: ShardedSnapshotDataset(
+                    args,
+                    episode_start=0,
+                    episode_end=4,
+                    use_hypergraphs=False,
+                    use_edge_attr=False,
+                    additional_data_idx=[None, None, None],
+                )
+            )
+
+            self.assertTrue(
+                any(
+                    "inferring them from contiguous graph_map_id range"
+                    in message
+                    for message in warnings
+                )
+            )
 
     def test_sharded_training_split_builds_shared_index_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

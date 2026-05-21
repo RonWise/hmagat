@@ -6,6 +6,10 @@ from loguru import logger
 from pibt.pypibt.pibt import PIBT
 from hmagat.utils import get_neighbors
 
+
+def get_env_sampling_seed(env):
+    return int(getattr(env.grid_config, "sampling_seed", env.grid_config.seed))
+
 class BaseCollisionShielding:
     def __init__(
         self,
@@ -54,7 +58,7 @@ class NaiveCollisionShielding(BaseCollisionShielding):
             model, env, sampling_method, sampling_temperature, rt_data_generator
         )
         if self.sampling_method == "probabilistic":
-            self.rng = np.random.default_rng(seed=env.grid_config.seed)
+            self.rng = np.random.default_rng(seed=get_env_sampling_seed(env))
 
     def shield(self, actions):
         if self.sampling_method == "deterministic":
@@ -296,7 +300,7 @@ class PIBTCollisionShielding(BaseCollisionShielding):
             starts=starts,
             goals=goals,
             moves=env.grid_config.MOVES,
-            seed=env.grid_config.seed,
+            seed=get_env_sampling_seed(env),
             sampling_method=sampling_method,
             dynamic_temperature=temperature_strategy != "constant",
         )

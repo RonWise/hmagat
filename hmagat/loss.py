@@ -22,6 +22,12 @@ class LossWrapper(torch.nn.Module):
         if field_to_use != "y":
             self.accuracy_key = f"{field_to_use}_accuracy"
 
+    def get_num_supervised_samples(self, data):
+        target_actions = data[self.field_to_use]
+        if not self.train_on_terminated_agents:
+            target_actions = target_actions[~data.terminated]
+        return int(target_actions.shape[0])
+
     def get_accuracies(self, out, data, model, split="train"):
         if self.accuracy_func is None:
             return dict()

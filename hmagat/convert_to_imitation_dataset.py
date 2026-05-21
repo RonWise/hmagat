@@ -257,6 +257,11 @@ def generate_processed_dataset_shards(args):
 
     for shard_idx, record in enumerate(iter_raw_expert_shards(args)):
         payload = record["payload"]
+        original_sample_ids = [
+            int(payload["sample_start"] + local_idx)
+            for local_idx, success in enumerate(payload["seed_mask"])
+            if success
+        ]
         dense_dataset = generate_graph_dataset(
             payload["dataset"],
             args.comm_radius,
@@ -287,6 +292,7 @@ def generate_processed_dataset_shards(args):
             snapshot_count=snapshot_count,
             graph_map_id_start=graph_map_id_start,
             graph_map_id_end=graph_map_id_end,
+            original_sample_ids=original_sample_ids,
         )
         entries.append(entry)
         graph_map_id_offset += saved_samples

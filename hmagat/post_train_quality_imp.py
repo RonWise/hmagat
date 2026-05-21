@@ -18,7 +18,11 @@ import torch.optim as optim
 
 from torch_geometric.loader import DataLoader
 
-from hmagat.training_args import add_training_args
+from hmagat.training_args import add_training_args, validate_training_args_contract
+from hmagat.checkpointing import (
+    extract_model_state_dict_from_checkpoint,
+    load_partial_checkpoint_into_model,
+)
 
 from hmagat.convert_to_imitation_dataset import (
     add_imitation_dataset_args,
@@ -273,6 +277,7 @@ def main():
     parser.add_argument("--oe_every_num_epochs", type=int, default=None)
 
     args = parser.parse_args()
+    validate_training_args_contract(args)
     print(args)
 
     assert args.save_termination_state
@@ -300,7 +305,7 @@ def main():
     np.random.seed(args.model_seed)
     random.seed(args.model_seed)
 
-    from hmagat.modules.agents import get_model, load_partial_state_dict
+    from hmagat.modules.agents import get_model
 
     model, hypergraph_model, dataset_kwargs = get_model(args, device)
 
@@ -434,14 +439,22 @@ def main():
     if args.pretrain_weights_path is not None:
         print("Loading Weights.............")
         pretrain_path = pathlib.Path(args.pretrain_weights_path)
-        state_dict = torch.load(pretrain_path, map_location=device)
+        state_dict = extract_model_state_dict_from_checkpoint(
+            torch.load(pretrain_path, map_location=device),
+            pretrain_path,
+            print_prefix="[pretrain] ",
+        )
         model.load_state_dict(state_dict)
 
     if args.load_partial_parameters_path is not None:
         print("Partially Loading Weights.............")
         partial_path = pathlib.Path(args.load_partial_parameters_path)
-        state_dict = torch.load(partial_path, map_location=device)
-        load_partial_state_dict(model, state_dict, print_prefix="[partial-load]")
+        load_partial_checkpoint_into_model(
+            model,
+            partial_path,
+            map_location=device,
+            print_prefix="[partial-load] ",
+        )
 
     queue = mp.Queue()
     done_event = mp.Event()

@@ -441,6 +441,19 @@ class ShardedExpertGenerationTest(unittest.TestCase):
             with mock.patch("sys.argv", argv):
                 audit_sequence_dataset.main()
 
+            stamp_path = os.path.join(
+                tmp_dir,
+                "processed_dataset",
+                "shards",
+                "sequence_audit.json",
+            )
+            self.assertTrue(os.path.exists(stamp_path))
+            with open(stamp_path) as f:
+                stamp = json.load(f)
+            self.assertEqual(stamp["status"], "passed")
+            self.assertTrue(stamp["checked_train"])
+            self.assertFalse(stamp["checked_validation"])
+
     def test_sharded_audit_accepts_separate_positions_manifest_edge_attr(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             _write_shard(

@@ -1,4 +1,7 @@
 import argparse
+import shlex
+import subprocess
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageSequence, ImageDraw, ImageFont
@@ -37,6 +40,59 @@ def resize_if_needed(img: Image.Image, target_width: int) -> Image.Image:
     return img.resize((target_width, int(img.height * ratio)), Image.LANCZOS)
 
 
+def get_header_height(font):
+    bbox = font.getbbox("Ag")
+    text_h = bbox[3] - bbox[1]
+    return text_h + 28
+
+
+def build_gif_with_ffmpeg(frames_dir: Path, output_path: Path, durations_ms):
+    palette_path = output_path.with_suffix(".palette.png")
+    manifest_path = frames_dir / "frames.txt"
+    frame_paths = [frames_dir / f"frame_{idx:04d}.png" for idx in range(len(durations_ms))]
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        for frame_path, duration_ms in zip(frame_paths, durations_ms):
+            fh.write(f"file {shlex.quote(str(frame_path))}\n")
+            fh.write(f"duration {duration_ms / 1000.0:.6f}\n")
+        fh.write(f"file {shlex.quote(str(frame_paths[-1]))}\n")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(manifest_path),
+            "-vf",
+            "palettegen",
+            str(palette_path),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(manifest_path),
+            "-i",
+            str(palette_path),
+            "-lavfi",
+            "paletteuse",
+            str(output_path),
+        ],
+        check=True,
+    )
+    palette_path.unlink(missing_ok=True)
+    manifest_path.unlink(missing_ok=True)
+
+
 def main():
     args = parse_args()
     left_path = Path(args.left)
@@ -67,49 +123,57 @@ def main():
         font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 20)
     except OSError:
         font = ImageFont.load_default()
-
-    combined = []
-    for start, duration in zip(boundaries[:-1], segments):
-        li = frame_index_at(start, left_boundaries)
-        ri = frame_index_at(start, right_boundaries)
-        lf = left_frames[li]
-        rf = right_frames[ri]
-
-        if args.max_width is not None:
-            half_width = max(64, args.max_width // 2)
-            lf = resize_if_needed(lf, half_width)
-            rf = resize_if_needed(rf, half_width)
-
-        canvas = Image.new('RGBA', (lf.width + rf.width, max(lf.height, rf.height)), (255, 255, 255, 255))
-        canvas.paste(lf, (0, 0), lf)
-        canvas.paste(rf, (lf.width, 0), rf)
-
-        draw = ImageDraw.Draw(canvas)
-        divider_x = lf.width
-        draw.line((divider_x, 0, divider_x, canvas.height), fill=(80, 80, 80, 255), width=3)
-
-        for label, x0, x1 in ((args.left_label, 0, lf.width), (args.right_label, lf.width, lf.width + rf.width)):
-            bbox = draw.textbbox((0, 0), label, font=font)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            tx = x0 + (x1 - x0 - text_w) // 2
-            ty = 10
-            draw.rounded_rectangle((tx - 10, ty - 6, tx + text_w + 10, ty + text_h + 6), radius=10, fill=(255, 255, 255, 220))
-            draw.text((tx, ty), label, font=font, fill=(20, 20, 20, 255))
-
-        combined.append((canvas.convert('P', palette=Image.ADAPTIVE), duration))
+    header_height = get_header_height(font)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    first, first_duration = combined[0]
-    rest = [frame for frame, _ in combined[1:]]
-    durations = [first_duration] + [duration for _, duration in combined[1:]]
-    first.save(output_path, save_all=True, append_images=rest, duration=durations, loop=0, disposal=2)
+    with tempfile.TemporaryDirectory(prefix="compare_gif_") as tmpdir:
+        frames_dir = Path(tmpdir)
+        out_idx = 0
+        segment_durations_ms = []
+        for idx, (start, duration) in enumerate(zip(boundaries[:-1], segments)):
+            li = frame_index_at(start, left_boundaries)
+            ri = frame_index_at(start, right_boundaries)
+            lf = left_frames[li]
+            rf = right_frames[ri]
+
+            if args.max_width is not None:
+                half_width = max(64, args.max_width // 2)
+                lf = resize_if_needed(lf, half_width)
+                rf = resize_if_needed(rf, half_width)
+
+            canvas = Image.new(
+                'RGBA',
+                (lf.width + rf.width, max(lf.height, rf.height) + header_height),
+                (255, 255, 255, 255),
+            )
+            canvas.paste(lf, (0, header_height), lf)
+            canvas.paste(rf, (lf.width, header_height), rf)
+
+            draw = ImageDraw.Draw(canvas)
+            divider_x = lf.width
+            draw.line((0, header_height, canvas.width, header_height), fill=(80, 80, 80, 255), width=3)
+            draw.line((divider_x, 0, divider_x, canvas.height), fill=(80, 80, 80, 255), width=3)
+
+            for label, x0, x1 in ((args.left_label, 0, lf.width), (args.right_label, lf.width, lf.width + rf.width)):
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                tx = x0 + (x1 - x0 - text_w) // 2
+                ty = 10
+                draw.rounded_rectangle((tx - 10, ty - 6, tx + text_w + 10, ty + text_h + 6), radius=10, fill=(255, 255, 255, 220))
+                draw.text((tx, ty), label, font=font, fill=(20, 20, 20, 255))
+
+            canvas.save(frames_dir / f"frame_{out_idx:04d}.png")
+            segment_durations_ms.append(duration)
+            out_idx += 1
+
+        build_gif_with_ffmpeg(frames_dir, output_path, segment_durations_ms)
 
     print(output_path)
     print(f'left_total_ms={left_total}')
     print(f'right_total_ms={right_total}')
-    print(f'combined_frames={len(combined)}')
-    print(f'combined_total_ms={sum(durations)}')
+    print(f'combined_frames={len(segments)}')
+    print(f'combined_total_ms={sum(segments)}')
 
 
 if __name__ == '__main__':

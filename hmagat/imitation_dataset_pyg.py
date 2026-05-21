@@ -1,3 +1,5 @@
+import time
+
 from tqdm import tqdm
 
 import torch
@@ -148,6 +150,11 @@ def validate_sequence_dataset_assumptions(
         graph_map_id = snapshot_dataset.graph_map_id
 
     episode_indices = group_indices_by_graph_map_id(graph_map_id)
+    if progress_label is not None:
+        logger.info(
+            f"{progress_label}: grouped episodes={len(episode_indices)}, "
+            f"snapshot_dataset_len={len(snapshot_dataset)}. Starting checks."
+        )
     progress = None
     if progress_label is not None:
         progress = ProgressLogger(
@@ -213,12 +220,19 @@ def validate_sequence_dataset_assumptions(
                 extra=f"snapshots={num_snapshots}",
             )
 
-    return {
+    result = {
         "num_episodes": len(episode_indices),
         "num_snapshots": num_snapshots,
         "episode_lengths": [len(indices) for indices in episode_indices],
         "checked_agent_id": not missing_agent_id_warning_emitted,
     }
+    if progress_label is not None:
+        logger.info(
+            f"{progress_label} finished: episodes={result['num_episodes']}, "
+            f"snapshots={result['num_snapshots']}, "
+            f"checked_agent_id={result['checked_agent_id']}"
+        )
+    return result
 
 
 class MAPFSequenceDataset(Dataset):
@@ -241,43 +255,119 @@ class MAPFSequenceDataset(Dataset):
 
 
 class MAPFSequenceBatch:
-    def __init__(self, timesteps, active_episode_indices, sequence_lengths):
+    def __init__(
+        self,
+        timesteps,
+        active_episode_indices,
+        sequence_lengths,
+        *,
+        active_episode_index_lists=None,
+        timestep_ptr_lists=None,
+        graph_counts=None,
+        first_step_graph_counts=None,
+        node_row_counts=None,
+    ):
         self.timesteps = timesteps
         self.active_episode_indices = active_episode_indices
         self.sequence_lengths = sequence_lengths
+        self.active_episode_index_lists = active_episode_index_lists
+        self.timestep_ptr_lists = timestep_ptr_lists
+        self.graph_counts = graph_counts
+        self.first_step_graph_counts = first_step_graph_counts
+        self.node_row_counts = node_row_counts
 
     def __len__(self):
         return len(self.timesteps)
+
+
+def _graph_num_node_rows(data):
+    x = getattr(data, "x", None)
+    if x is not None:
+        return int(x.shape[0])
+    num_nodes = getattr(data, "num_nodes", None)
+    if num_nodes is None:
+        raise ValueError(
+            "Cannot determine number of node rows for sequence timestep item."
+        )
+    return int(num_nodes)
 
 
 def collate_mapf_sequences(sequences):
     if len(sequences) == 0:
         raise ValueError("Cannot collate an empty sequence batch.")
 
-    sequence_lengths = torch.tensor([len(sequence) for sequence in sequences])
+    sequence_lengths_list = [len(sequence) for sequence in sequences]
+    sequence_lengths = torch.tensor(sequence_lengths_list)
     max_length = int(torch.max(sequence_lengths).item())
     if max_length == 0:
         raise ValueError("Cannot collate sequence batch with no timesteps.")
 
+    timestep_items = [[] for _ in range(max_length)]
+    timestep_active_indices = [[] for _ in range(max_length)]
+    for episode_idx, sequence in enumerate(sequences):
+        append_timestep_items = getattr(sequence, "_append_timestep_items", None)
+        if append_timestep_items is not None:
+            append_timestep_items(timestep_items, timestep_active_indices, episode_idx)
+            continue
+        for timestep, data in enumerate(sequence):
+            timestep_items[timestep].append(data)
+            timestep_active_indices[timestep].append(episode_idx)
+
     timesteps = []
     active_episode_indices = []
-    for timestep in range(max_length):
-        timestep_items = []
-        active_indices = []
-        for episode_idx, sequence in enumerate(sequences):
-            if timestep >= len(sequence):
-                continue
-            timestep_items.append(sequence[timestep])
-            active_indices.append(episode_idx)
-
-        timesteps.append(Batch.from_data_list(timestep_items))
-        active_episode_indices.append(torch.tensor(active_indices, dtype=torch.long))
+    active_episode_index_lists = []
+    timestep_ptr_lists = []
+    graph_counts = []
+    first_step_graph_counts = []
+    node_row_counts = []
+    for items, indices in zip(timestep_items, timestep_active_indices):
+        batch = Batch.from_data_list(items)
+        timesteps.append(batch)
+        active_episode_indices.append(torch.tensor(indices, dtype=torch.long))
+        active_episode_index_lists.append(tuple(int(index) for index in indices))
+        timestep_ptr_lists.append(tuple(int(offset) for offset in batch.ptr.tolist()))
+        graph_counts.append(len(items))
+        first_step_graph_counts.append(
+            sum(bool(data.first_step.item()) for data in items)
+        )
+        node_row_counts.append(sum(_graph_num_node_rows(data) for data in items))
 
     return MAPFSequenceBatch(
         timesteps=timesteps,
         active_episode_indices=active_episode_indices,
         sequence_lengths=sequence_lengths,
+        active_episode_index_lists=tuple(active_episode_index_lists),
+        timestep_ptr_lists=tuple(timestep_ptr_lists),
+        graph_counts=tuple(graph_counts),
+        first_step_graph_counts=tuple(first_step_graph_counts),
+        node_row_counts=tuple(node_row_counts),
     )
+
+
+class SequenceBatchCollator:
+    def __init__(self):
+        self.reset_metrics()
+
+    def reset_metrics(self):
+        self.total_collate_calls = 0
+        self.total_collate_time_sec = 0.0
+        self.last_collate_time_sec = 0.0
+
+    def metrics_snapshot(self):
+        return {
+            "collate_calls": int(self.total_collate_calls),
+            "collate_time_sec": float(self.total_collate_time_sec),
+            "last_collate_time_sec": float(self.last_collate_time_sec),
+        }
+
+    def __call__(self, sequences):
+        start_time = time.monotonic()
+        batch = collate_mapf_sequences(sequences)
+        elapsed = time.monotonic() - start_time
+        self.total_collate_calls += 1
+        self.total_collate_time_sec += elapsed
+        self.last_collate_time_sec = elapsed
+        return batch
 
 
 class MAPFGraphDataset(Dataset):

@@ -32,6 +32,7 @@ from hmagat.imitation_dataset_pyg import (
     MAPFHypergraphDataset,
     validate_sequence_dataset_assumptions,
 )
+from hmagat.sharded_training_dataset import write_sequence_audit_stamp
 from hmagat.run_expert import add_expert_dataset_args
 from hmagat.training_args import add_training_args
 
@@ -403,6 +404,13 @@ def _run_sharded_lightweight_audit(args):
         train_end,
         validation_end,
     )
+    stamp_path, _ = write_sequence_audit_stamp(
+        args,
+        manifest,
+        checked_train=checked_train,
+        checked_validation=checked_validation,
+    )
+    logger.info("Wrote sharded sequence audit stamp: {}", stamp_path)
     return checked_train, checked_validation
 
 

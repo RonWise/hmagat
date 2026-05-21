@@ -217,6 +217,7 @@ def write_stage_shard(
     snapshot_count,
     graph_map_id_start=None,
     graph_map_id_end=None,
+    original_sample_ids=None,
 ):
     output_dir = stage_shards_dir(args, stage_dir_name)
     path = output_dir / shard_output_name(args, stage, shard_idx, sample_start, sample_end)
@@ -232,6 +233,7 @@ def write_stage_shard(
         "snapshot_count": int(snapshot_count),
         "graph_map_id_start": graph_map_id_start,
         "graph_map_id_end": graph_map_id_end,
+        "original_sample_ids": _jsonable(original_sample_ids),
         "num_samples": args.num_samples,
         "dataset_seed": args.dataset_seed,
         "override_name": args.override_name,

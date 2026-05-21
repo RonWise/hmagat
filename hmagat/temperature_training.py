@@ -14,7 +14,7 @@ from torch_geometric.data import Batch
 
 from hmagat.run_expert import add_expert_dataset_args
 
-from hmagat.training_args import add_training_args
+from hmagat.training_args import add_training_args, validate_training_args_contract
 from hmagat.convert_to_imitation_dataset import add_imitation_dataset_args
 from hmagat.generate_hypergraphs import add_hypergraph_generation_args
 
@@ -23,6 +23,10 @@ from hmagat.modules.model.run_model import run_model_on_grid
 from grid_config_generator import grid_config_generator_factory
 
 from hmagat.generate_additional_data import add_additional_data_args
+from hmagat.checkpointing import (
+    load_model_state_dict_from_checkpoint_path,
+    resolve_evaluation_checkpoint_path,
+)
 
 from hmagat.modules.temperature_sampling.actor_critic import (
     get_actor_critic,
@@ -286,6 +290,7 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default=None)
 
     args = parser.parse_args()
+    validate_training_args_contract(args)
     print(args)
 
     assert args.save_termination_state
@@ -307,16 +312,17 @@ def main():
 
     model, hypergraph_model, dataset_kwargs = get_model(args, device)
 
-    if args.model_epoch_num is None:
-        checkpoint_path = pathlib.Path(args.checkpoints_dir, "best.pt")
-        if not checkpoint_path.exists():
-            checkpoint_path = pathlib.Path(args.checkpoints_dir, "best_low_val.pt")
-    else:
-        checkpoint_path = pathlib.Path(
-            args.checkpoints_dir, f"epoch_{args.model_epoch_num}.pt"
-        )
+    checkpoint_path = resolve_evaluation_checkpoint_path(
+        args.checkpoints_dir,
+        model_epoch_num=args.model_epoch_num,
+        map_location=device,
+    )
 
-    state_dict = torch.load(checkpoint_path, map_location=device)
+    state_dict = load_model_state_dict_from_checkpoint_path(
+        checkpoint_path,
+        map_location=device,
+        print_prefix="[temperature-base-load] ",
+    )
     model.load_state_dict(state_dict)
 
     model = model.eval()

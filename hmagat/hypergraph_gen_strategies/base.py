@@ -363,7 +363,12 @@ class kMeansHyperedgeGenerator(HyperedgeGenerator):
 
     def reset_state(self, env):
         self.grid = env.grid.get_obstacles(ignore_borders=True)
-        self.rng = np.random.default_rng(self.seed)
+        runtime_seed = self.seed
+        if env is not None and getattr(env, "grid_config", None) is not None:
+            runtime_seed = getattr(env.grid_config, "sampling_seed", env.grid_config.seed)
+        self.rng = np.random.default_rng(runtime_seed)
+        self.runtime_seed = int(runtime_seed)
+        self.sklearn_random_state = self.runtime_seed % (2**32)
         self.colourings = self.colour_grid()
 
     def update_colours(self, colours, obs):
@@ -440,9 +445,11 @@ class kMeansHyperedgeGenerator(HyperedgeGenerator):
         for _ in range(self.num_updates):
             colours = self.update_colours(colours, obs)
 
-        clusterer = KMeans(n_clusters=2 * num_final_colours, max_iter=100).fit(
-            colours[obs == 0]
-        )
+        clusterer = KMeans(
+            n_clusters=2 * num_final_colours,
+            max_iter=100,
+            random_state=self.sklearn_random_state,
+        ).fit(colours[obs == 0])
 
         one_hot_colouring = np.eye(2 * num_final_colours)
         one_hot_groupings = one_hot_colouring[clusterer.labels_]

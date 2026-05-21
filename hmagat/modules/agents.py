@@ -882,24 +882,38 @@ class DecentralPlannerGATNet(torch.nn.Module):
         return x
 
     def _apply_coordination_state(self, x):
+        state_dtype = self.coordination_state_cell.weight_ih.dtype
+        state_input = x if x.dtype == state_dtype else x.to(state_dtype)
+        autocast_kwargs = {"device_type": x.device.type, "enabled": False}
         if self.simulation:
             prev_state = self._coordination_state
             if (
                 prev_state is None
                 or prev_state.shape[0] != x.shape[0]
                 or prev_state.device != x.device
-                or prev_state.dtype != x.dtype
+                or prev_state.dtype != state_dtype
             ):
-                prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
-            state = self.coordination_state_cell(x, prev_state)
+                prev_state = torch.zeros(
+                    (x.shape[0], self.coordination_state_size),
+                    device=x.device,
+                    dtype=state_dtype,
+                )
+            with torch.autocast(**autocast_kwargs):
+                state = self.coordination_state_cell(state_input, prev_state)
             if self.detach_coordination_state:
                 self._coordination_state = state.detach()
             else:
                 self._coordination_state = state
         else:
-            prev_state = x.new_zeros((x.shape[0], self.coordination_state_size))
-            state = self.coordination_state_cell(x, prev_state)
-        return torch.cat([x, state], dim=-1)
+            prev_state = torch.zeros(
+                (x.shape[0], self.coordination_state_size),
+                device=x.device,
+                dtype=state_dtype,
+            )
+            with torch.autocast(**autocast_kwargs):
+                state = self.coordination_state_cell(state_input, prev_state)
+        state_for_output = state if state.dtype == x.dtype else state.to(x.dtype)
+        return torch.cat([x, state_for_output], dim=-1)
 
 
 def _decode_residual_args(args):

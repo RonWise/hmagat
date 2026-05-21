@@ -45,6 +45,10 @@ ADD_DATA_FILE_NAME_ALIASES = {
 
 
 def add_additional_data_args(parser):
+    if not any(action.dest == "take_all_seeds" for action in parser._actions):
+        parser.add_argument(
+            "--take_all_seeds", action=argparse.BooleanOptionalAction, default=False
+        )
     parser.add_argument("--add_data_num_previous_actions", type=int, default=None)
     parser.add_argument(
         "--add_data_cost_to_go", action=argparse.BooleanOptionalAction, default=False

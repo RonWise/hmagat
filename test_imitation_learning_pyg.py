@@ -1,10 +1,12 @@
 import argparse
+import csv
 import pickle
 import pathlib
 import numpy as np
 import wandb
 from collections import OrderedDict
 import time
+import subprocess
 
 import torch
 
@@ -24,11 +26,97 @@ from hmagat.temperature_training import (
     add_temperature_sampling_args,
     get_temperature_sampling_model,
 )
-from hmagat.modules.agents import get_model, load_partial_state_dict
+from hmagat.modules.agents import get_model
+from hmagat.checkpointing import (
+    load_model_state_dict_from_checkpoint_path,
+    load_partial_checkpoint_into_model,
+    resolve_evaluation_checkpoint_path,
+)
 
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
+
+
+def _resolve_step_metrics_model_label(args):
+    if args.step_metrics_model_label is not None:
+        return args.step_metrics_model_label
+    if args.run_name is not None:
+        return args.run_name
+    return args.imitation_learning_model
+
+
+def _build_step_metrics_rows(
+    *,
+    model_label,
+    graph_idx,
+    instance_seed,
+    sampling_seed,
+    solved_agents_per_step,
+    total_agents,
+    max_episode_steps,
+    rollout_success,
+    makespan,
+    pad_to_max_episode_steps,
+):
+    solved_agents_per_step = list(int(v) for v in solved_agents_per_step)
+    if not solved_agents_per_step:
+        solved_agents_per_step = [0]
+
+    if pad_to_max_episode_steps and max_episode_steps is not None:
+        target_len = max(1, int(max_episode_steps) + 1)
+        if len(solved_agents_per_step) < target_len:
+            solved_agents_per_step.extend(
+                [solved_agents_per_step[-1]] * (target_len - len(solved_agents_per_step))
+            )
+        elif len(solved_agents_per_step) > target_len:
+            solved_agents_per_step = solved_agents_per_step[:target_len]
+
+    rows = []
+    for step_idx, solved_agents in enumerate(solved_agents_per_step):
+        success_fraction = 0.0 if total_agents <= 0 else solved_agents / total_agents
+        rows.append(
+            {
+                "model": model_label,
+                "graph_idx": graph_idx,
+                "instance_seed": int(instance_seed),
+                "sampling_seed": int(sampling_seed),
+                "step": step_idx,
+                "solved_agents": int(solved_agents),
+                "total_agents": int(total_agents),
+                "success_fraction": float(success_fraction),
+                "all_agents_on_goal": int(solved_agents == total_agents),
+                "rollout_success": int(bool(rollout_success)),
+                "makespan": int(makespan),
+                "max_episode_steps": int(max_episode_steps),
+            }
+        )
+    return rows
+
+
+def _append_step_metrics_csv(csv_path, rows):
+    csv_path = pathlib.Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "model",
+        "graph_idx",
+        "instance_seed",
+        "sampling_seed",
+        "step",
+        "solved_agents",
+        "total_agents",
+        "success_fraction",
+        "all_agents_on_goal",
+        "rollout_success",
+        "makespan",
+        "max_episode_steps",
+    ]
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 class TimingModelWrapper:
@@ -68,6 +156,8 @@ def main():
 
     parser.add_argument("--test_num_samples", type=int, default=2000)
     parser.add_argument("--test_dataset_seed", type=int, default=42)
+    parser.add_argument("--test_fixed_instance_seed", type=int, default=None)
+    parser.add_argument("--test_sampling_seed", type=int, default=None)
     parser.add_argument("--test_dataset_dir", type=str, default="dataset")
 
     parser.add_argument("--test_comm_radius", type=int, default=7)
@@ -145,6 +235,13 @@ def main():
     parser.add_argument("--wandb_tag", type=str, default=None)
 
     parser.add_argument("--record_timings", action="store_true", default=False)
+    parser.add_argument("--step_metrics_csv_path", type=str, default=None)
+    parser.add_argument("--step_metrics_model_label", type=str, default=None)
+    parser.add_argument(
+        "--step_metrics_pad_to_max_episode_steps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     args = parser.parse_args()
     print(args)
@@ -173,22 +270,27 @@ def main():
         num_parameters = count_parameters(model)
         print(f"Num Parameters: {num_parameters}")
 
-    if args.model_epoch_num is None:
-        checkpoint_path = pathlib.Path(args.checkpoints_dir, "best.pt")
-        if not checkpoint_path.exists():
-            checkpoint_path = pathlib.Path(args.checkpoints_dir, "best_low_val.pt")
-    else:
-        checkpoint_path = pathlib.Path(
-            args.checkpoints_dir, f"epoch_{args.model_epoch_num}.pt"
-        )
+    checkpoint_path = resolve_evaluation_checkpoint_path(
+        args.checkpoints_dir,
+        model_epoch_num=args.model_epoch_num,
+        map_location=device,
+    )
 
     if args.load_partial_parameters_path is not None:
         print("Partially Loading Weights.............")
         partial_path = pathlib.Path(args.load_partial_parameters_path)
-        state_dict = torch.load(partial_path, map_location=device)
-        load_partial_state_dict(model, state_dict, print_prefix="[partial-load]")
+        load_partial_checkpoint_into_model(
+            model,
+            partial_path,
+            map_location=device,
+            print_prefix="[partial-load] ",
+        )
     else:
-        state_dict = torch.load(checkpoint_path, map_location=device)
+        state_dict = load_model_state_dict_from_checkpoint_path(
+            checkpoint_path,
+            map_location=device,
+            print_prefix="[eval-load] ",
+        )
         model.load_state_dict(state_dict)
     model = model.eval()
 
@@ -232,12 +334,14 @@ def main():
                 )
                 aux_func.makespan = 0
                 aux_func.costs = np.ones(env.get_num_agents())
+                aux_func.step_solved_agents = [int(np.sum(env.was_on_goal))]
             else:
                 new_pos = np.array([obs["global_xy"] for obs in observations])
                 at_goals = np.array(env.was_on_goal)
                 aux_func.makespan += 1
                 aux_func.original_pos = new_pos
                 aux_func.costs[~at_goals] = aux_func.makespan + 1
+                aux_func.step_solved_agents.append(int(np.sum(env.was_on_goal)))
 
     else:
         file_path = pathlib.Path(args.svg_save_dir)
@@ -277,12 +381,14 @@ def main():
                 aux_func.makespan = 0
                 aux_func.costs = np.ones(env.get_num_agents())
                 aux_func.edge_index = []
+                aux_func.step_solved_agents = [int(np.sum(env.was_on_goal))]
             else:
                 new_pos = np.array([obs["global_xy"] for obs in observations])
                 at_goals = np.array(env.was_on_goal)
                 aux_func.makespan += 1
                 aux_func.original_pos = new_pos
                 aux_func.costs[~at_goals] = aux_func.makespan + 1
+                aux_func.step_solved_agents.append(int(np.sum(env.was_on_goal)))
             gdata = rtdg(observations, env)
             aux_func.edge_index.append(_extract_edge_data(gdata))
 
@@ -304,7 +410,16 @@ def main():
         use_target_vec = "target-vec"
 
     for i, seed in enumerate(seeds):
-        grid_config = _grid_config_generator(seed)
+        instance_seed = int(seed)
+        if args.test_fixed_instance_seed is not None:
+            instance_seed = int(args.test_fixed_instance_seed)
+
+        sampling_seed = instance_seed
+        if args.test_sampling_seed is not None:
+            sampling_seed = int(args.test_sampling_seed)
+
+        grid_config = _grid_config_generator(instance_seed)
+        object.__setattr__(grid_config, "sampling_seed", sampling_seed)
         success, env, _ = run_model_on_grid(
             model,
             device,
@@ -335,7 +450,8 @@ def main():
             "average_makespan": np.mean(all_makespan),
             "average_partial_success_rate": np.mean(all_partial_success_rate),
             "average_sum_of_costs": np.mean(all_sum_of_costs),
-            "seed": seed,
+            "seed": instance_seed,
+            "sampling_seed": sampling_seed,
             "success": success,
             "makespan": makespan,
             "partial_success_rate": partial_success_rate,
@@ -356,6 +472,21 @@ def main():
             file_path = pathlib.Path(f"{args.svg_save_dir}", f"edge_index_{i}.pkl")
             with open(file_path, "wb") as f:
                 pickle.dump(aux_func.edge_index, f)
+
+        if args.step_metrics_csv_path is not None:
+            step_metric_rows = _build_step_metrics_rows(
+                model_label=_resolve_step_metrics_model_label(args),
+                graph_idx=i,
+                instance_seed=instance_seed,
+                sampling_seed=sampling_seed,
+                solved_agents_per_step=aux_func.step_solved_agents,
+                total_agents=env.get_num_agents(),
+                max_episode_steps=args.test_max_episode_steps,
+                rollout_success=success,
+                makespan=makespan,
+                pad_to_max_episode_steps=args.step_metrics_pad_to_max_episode_steps,
+            )
+            _append_step_metrics_csv(args.step_metrics_csv_path, step_metric_rows)
 
         print(
             f"Testing Graph {i + 1}/{len(seeds)}, "

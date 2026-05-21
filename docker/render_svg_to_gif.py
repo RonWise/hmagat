@@ -32,6 +32,32 @@ def parse_args():
         default="Step",
         help="Prefix for step counter label",
     )
+    parser.add_argument(
+        "--sample-mode",
+        choices=["env-steps", "fps"],
+        default="env-steps",
+        help=(
+            "How to sample the animated SVG: one frame per environment step "
+            "or dense fps-based sampling."
+        ),
+    )
+    parser.add_argument(
+        "--step-time-scale",
+        type=float,
+        default=0.25,
+        help=(
+            "Environment-step to SVG-time scale used by POGEMA animation. "
+            "Needed to reconstruct true step count from SVG duration."
+        ),
+    )
+    parser.add_argument(
+        "--include-success-fraction",
+        action="store_true",
+        help=(
+            "Append current fraction of agents already standing on their own "
+            "targets to the frame label."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -47,11 +73,84 @@ def extract_duration(svg_text: str) -> float:
     return float(svg_text[start:end])
 
 
-async def render_frames(svg_path: Path, frames_dir: Path, fps: int, width: int, height: int, scale: float):
-    text = svg_path.read_text()
-    duration = extract_duration(text)
-    num_frames = max(1, int(duration * fps))
+async def render_frames(
+    svg_path: Path,
+    frames_dir: Path,
+    sample_times: list[float],
+    width: int,
+    height: int,
+    scale: float,
+):
+    prepare_js = """
+    (width, height) => {
+        const html = document.documentElement;
+        const body = document.body;
+        const svgEl = document.querySelector("svg");
+
+        html.style.margin = "0";
+        html.style.padding = "0";
+        html.style.width = `${width}px`;
+        html.style.height = `${height}px`;
+        html.style.overflow = "hidden";
+        html.style.background = "white";
+
+        if (body) {
+            body.style.margin = "0";
+            body.style.padding = "0";
+            body.style.width = `${width}px`;
+            body.style.height = `${height}px`;
+            body.style.overflow = "hidden";
+            body.style.background = "white";
+        }
+
+        svgEl.style.display = "block";
+        svgEl.style.width = `${width}px`;
+        svgEl.style.height = `${height}px`;
+        svgEl.style.maxWidth = `${width}px`;
+        svgEl.style.maxHeight = `${height}px`;
+        svgEl.style.margin = "0";
+        svgEl.style.padding = "0";
+        svgEl.style.overflow = "visible";
+        return {
+            svgWidth: svgEl.width.baseVal.value,
+            svgHeight: svgEl.height.baseVal.value,
+            clientWidth: svgEl.clientWidth,
+            clientHeight: svgEl.clientHeight,
+        };
+    }
+    """
     js = '(t) => { const svgEl = document.querySelector("svg"); svgEl.pauseAnimations(); svgEl.setCurrentTime(t); }'
+    success_js = """
+    () => {
+        const agents = Array.from(document.querySelectorAll("circle.agent")).map((node) => ({
+            cx: node.cx.animVal.value,
+            cy: node.cy.animVal.value,
+            visibility: getComputedStyle(node).visibility,
+        }));
+        const targets = Array.from(document.querySelectorAll("circle.target")).map((node) => ({
+            cx: node.cx.animVal.value,
+            cy: node.cy.animVal.value,
+            visibility: getComputedStyle(node).visibility,
+        }));
+
+        const total = Math.min(agents.length, targets.length);
+        const positionTolerance = 0.5;
+        let eligible = 0;
+        let matched = 0;
+        for (let i = 0; i < total; i += 1) {
+            if (agents[i].visibility === "hidden" || targets[i].visibility === "hidden") {
+                continue;
+            }
+            eligible += 1;
+            const dx = Math.abs(agents[i].cx - targets[i].cx);
+            const dy = Math.abs(agents[i].cy - targets[i].cy);
+            if (dx <= positionTolerance && dy <= positionTolerance) {
+                matched += 1;
+            }
+        }
+        return { matched, total: eligible };
+    }
+    """
 
     browser = await launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
     page = await browser.newPage()
@@ -60,23 +159,51 @@ async def render_frames(svg_path: Path, frames_dir: Path, fps: int, width: int, 
     )
     await page.goto(svg_path.resolve().as_uri(), {"waitUntil": "load"})
     await page.waitForSelector("svg")
+    await page.evaluate(prepare_js, width, height)
 
-    for i in range(num_frames):
-        t = min(duration, i / fps)
+    success_fractions = []
+    for i, t in enumerate(sample_times):
         await page.evaluate(js, t)
+        success_stats = await page.evaluate(success_js)
+        total = success_stats["total"]
+        success_fraction = 0.0 if total == 0 else success_stats["matched"] / total
+        success_fractions.append(success_fraction)
         await page.screenshot({"path": str(frames_dir / f"frame_{i:04d}.png")})
 
     await browser.close()
-    return duration, num_frames
+    return sample_times, success_fractions
+
+
+def infer_env_steps(duration: float, step_time_scale: float) -> int:
+    if step_time_scale <= 0:
+        raise ValueError("step_time_scale must be positive")
+    # POGEMA animations append one duplicate terminal state and use:
+    # dur = time_scale * (num_states - 1)
+    # where num_states = env_steps + 2.
+    return max(0, int(round(duration / step_time_scale)) - 1)
+
+
+def build_sample_times(duration: float, fps: int, sample_mode: str, step_time_scale: float):
+    if sample_mode == "fps":
+        return [min(duration, i / fps) for i in range(max(1, int(duration * fps)))]
+
+    env_steps = infer_env_steps(duration, step_time_scale)
+    max_time = max(0.0, duration - 1e-6)
+    step_time_epsilon = 1e-2
+    return [
+        0.0
+        if step_idx == 0
+        else min(max_time, step_idx * step_time_scale + step_time_epsilon)
+        for step_idx in range(env_steps + 1)
+    ]
 
 
 def add_frame_labels(
     frames_dir: Path,
-    fps: int,
-    duration: float,
-    num_frames: int,
+    sample_times: list[float],
     label_mode: str,
     label_prefix: str,
+    success_fractions: list[float] | None = None,
 ):
     if label_mode == "none":
         return
@@ -88,12 +215,11 @@ def add_frame_labels(
     except OSError:
         font = ImageFont.load_default()
 
-    for i in range(num_frames):
+    for i, time_s in enumerate(sample_times):
         frame_path = frames_dir / f"frame_{i:04d}.png"
         with Image.open(frame_path).convert("RGBA") as image:
             draw = ImageDraw.Draw(image)
             step_idx = i
-            time_s = min(duration, i / fps)
 
             if label_mode == "step":
                 label = f"{label_prefix} {step_idx}"
@@ -101,6 +227,9 @@ def add_frame_labels(
                 label = f"t = {time_s:.1f}s"
             else:
                 label = f"{label_prefix} {step_idx} | t = {time_s:.1f}s"
+
+            if success_fractions is not None:
+                label = f"{label} | {success_fractions[i]:.2f}"
 
             bbox = draw.textbbox((0, 0), label, font=font)
             text_w = bbox[2] - bbox[0]
@@ -167,11 +296,18 @@ def main():
     frames_dir.mkdir(parents=True, exist_ok=True)
     output_gif.parent.mkdir(parents=True, exist_ok=True)
 
-    duration, num_frames = asyncio.run(
+    duration = extract_duration(svg_path.read_text())
+    sample_times = build_sample_times(
+        duration=duration,
+        fps=args.fps,
+        sample_mode=args.sample_mode,
+        step_time_scale=args.step_time_scale,
+    )
+    rendered_sample_times, success_fractions = asyncio.run(
         render_frames(
             svg_path=svg_path,
             frames_dir=frames_dir,
-            fps=args.fps,
+            sample_times=sample_times,
             width=args.width,
             height=args.height,
             scale=args.scale,
@@ -179,11 +315,10 @@ def main():
     )
     add_frame_labels(
         frames_dir=frames_dir,
-        fps=args.fps,
-        duration=duration,
-        num_frames=num_frames,
+        sample_times=rendered_sample_times,
         label_mode=args.label_mode,
         label_prefix=args.label_prefix,
+        success_fractions=success_fractions if args.include_success_fraction else None,
     )
     build_gif(frames_dir=frames_dir, output_gif=output_gif, fps=args.fps)
 
@@ -191,7 +326,9 @@ def main():
     print(f"output={output_gif}")
     print(f"duration={duration}")
     print(f"fps={args.fps}")
-    print(f"frames={num_frames}")
+    print(f"frames={len(rendered_sample_times)}")
+    print(f"sample_mode={args.sample_mode}")
+    print(f"env_steps={infer_env_steps(duration, args.step_time_scale)}")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,35 @@
 import argparse
 
+from loguru import logger
+
 
 def add_training_args(parser):
     parser.add_argument("--validation_fraction", type=float, default=0.15)
     parser.add_argument("--test_fraction", type=float, default=0.15)
     parser.add_argument("--num_training_oe", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--sharded_dataset_cache_size", type=int, default=1)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument(
+        "--dataloader_pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--dataloader_persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=None)
+    parser.add_argument(
+        "--amp", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float16", "bfloat16"],
+    )
 
     parser.add_argument("--imitation_learning_model", type=str, default="MAGAT")
     parser.add_argument("--cnn_mode", type=str, default="basic-CNN")
@@ -23,6 +47,7 @@ def add_training_args(parser):
     parser.add_argument("--hyperedge_feature_generator", type=str, default="gcn")
 
     parser.add_argument("--load_partial_parameters_path", type=str, default=None)
+    parser.add_argument("--resume_checkpoint_path", type=str, default=None)
     parser.add_argument("--replace_model", type=str, default=None)
     parser.add_argument("--parameters_to_load", type=str, default="all")
     parser.add_argument("--parameters_to_freeze", type=str, default=None)
@@ -47,6 +72,8 @@ def add_training_args(parser):
         "--save_intmd_checkpoints", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument("--checkpoints_dir", type=str, default="checkpoints")
+    parser.add_argument("--tensorboard_dir", type=str, default=None)
+    parser.add_argument("--tensorboard_flush_secs", type=int, default=30)
 
     parser.add_argument(
         "--skip_validation", action=argparse.BooleanOptionalAction, default=False
@@ -170,10 +197,20 @@ def add_training_args(parser):
     parser.add_argument(
         "--validate_sequence_training_dataset",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
             "Run sequence dataset assumption checks before sequence training. "
-            "Disable only after an explicit dataset audit has already passed."
+            "For sharded sequence training, leaving this unset requires a prior "
+            "successful audit_sequence_dataset --use_shards run."
+        ),
+    )
+    parser.add_argument(
+        "--cs_warmup_freeze_baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Freeze pretrained HMAGAT baseline weights and train only the "
+            "coordination-state cell plus new HMAGAT-CS decoder columns."
         ),
     )
 
@@ -185,7 +222,21 @@ def add_training_args(parser):
     parser.add_argument("--oe_improve_quality_buffer", type=float, default=1.2)
     parser.add_argument("--oe_improve_quality_max_num", type=int, default=30)
     parser.add_argument("--oe_improve_quality_expert", type=str, default=None)
-
     parser.add_argument("--pretrain_weights_path", type=str, default=None)
 
     return parser
+
+
+def validate_training_args_contract(args):
+    if args.validation_every_epochs <= 0:
+        logger.warning(
+            "--validation_every_epochs must be positive; got "
+            f"{args.validation_every_epochs}."
+        )
+        raise ValueError("validation_every_epochs must be positive")
+    if getattr(args, "sharded_dataset_cache_size", 1) <= 0:
+        logger.warning(
+            "--sharded_dataset_cache_size must be positive; got "
+            f"{args.sharded_dataset_cache_size}."
+        )
+        raise ValueError("sharded_dataset_cache_size must be positive")
